@@ -736,16 +736,44 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
         story.append(s_table)
         story.append(Spacer(1, 3))
     elif not motivos.empty:
-        # Reemplazo: tabla de motivos con accion sugerida
+        # Tabla de motivos con accion sugerida (texto con wrap, no truncado)
         story.append(Paragraph("<b>Acciones por motivo (top 5)</b>", styles["Small"]))
         ac = motivos.head(5).copy()
-        ac["MotivoES"] = ac["MotivoES"].apply(lambda x: (x[:38] + "...") if isinstance(x, str) and len(x) > 40 else x)
-        ac["Accion"] = ac["Accion"].apply(lambda x: (x[:90] + "...") if isinstance(x, str) and len(x) > 92 else x)
-        ac = ac[["MotivoES", "Responsable", "Accion"]]
-        ac.columns = ["Motivo (ES)", "Resp.", "Accion sugerida"]
-        story.append(df_to_table(ac,
-                                 col_widths=[4.4*cm, 1.8*cm, 12.6*cm],
-                                 font_size=7.0))
+
+        cell_style = ParagraphStyle(
+            "ActCell", parent=styles["Body"],
+            fontName="Helvetica", fontSize=7.5, leading=9.5,
+            textColor=colors.HexColor("#1B2535"), alignment=0,
+        )
+        rows = [["Motivo (ES)", "Resp.", "Accion sugerida"]]
+        for _, r in ac.iterrows():
+            rows.append([
+                Paragraph(str(r["MotivoES"] or "").replace("&", "&amp;"), cell_style),
+                Paragraph(str(r["Responsable"] or "").replace("&", "&amp;"), cell_style),
+                Paragraph(str(r["Accion"] or "").replace("&", "&amp;"), cell_style),
+            ])
+        action_table = Table(rows,
+                             colWidths=[5.4 * cm, 1.8 * cm, 11.6 * cm],
+                             repeatRows=1)
+        ts = [
+            ("BACKGROUND", (0, 0), (-1, 0), PRIMARY),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 7.5),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LINEBELOW", (0, 0), (-1, 0), 1, ACCENT),
+            ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#DCE2EC")),
+        ]
+        for i in range(1, len(rows)):
+            if i % 2 == 0:
+                ts.append(("BACKGROUND", (0, i), (-1, i), LIGHT))
+        action_table.setStyle(TableStyle(ts))
+        story.append(action_table)
         story.append(Spacer(1, 3))
 
     # --- Conclusiones + Recomendaciones (compact, side by side) ---
