@@ -548,8 +548,12 @@ with col_b:
         denied = df_f.iloc[0:0]
 
     out_df = pd.DataFrame()
-    if "venta" in cols and cols["venta"] in denied.columns:
-        out_df["id"] = denied[cols["venta"]].astype(str).values
+    # Buscar columna user-id (no la ID de la venta)
+    id_candidates = ["id", "ID", "Id", "user_id", "userId", "userid",
+                     "id_usuario", "ID_usuario", "idUsuario", "Cliente_id", "id_cliente"]
+    id_col = next((c for c in id_candidates if c in denied.columns), None)
+    if id_col:
+        out_df["id"] = denied[id_col].astype(str).values
     else:
         out_df["id"] = range(1, len(denied) + 1)
     out_df["Cliente"] = denied[cols["cliente"]].astype(str).values if "cliente" in cols else ""
