@@ -251,6 +251,20 @@ with st.sidebar:
     else:
         st.caption("(sin fuente todavia)")
     st.markdown("---")
+    st.markdown("**Cache compartido (admin -> GM)**")
+    if shared_cache.is_configured():
+        cfg = shared_cache.cache_config()
+        st.caption(f"Repo: `{cfg['repo']}` · Rama: `{cfg['branch']}`")
+        meta = shared_cache.remote_meta()
+        if meta:
+            st.success(f"Ultima publicacion: {meta['date'][:16]}Z")
+            st.caption(f"Commit: `{meta['sha']}`")
+        else:
+            st.warning("Configurado pero sin datos publicados todavia. "
+                       "Pide al admin que cargue datos en `evo-debitos`.")
+    else:
+        st.error("NO configurado. Faltan secrets `GITHUB_TOKEN` y `GITHUB_REPO`.")
+    st.markdown("---")
     st.caption("Vista de Gerentes Generales. La sede es obligatoria.")
 
 

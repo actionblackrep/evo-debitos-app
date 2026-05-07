@@ -169,9 +169,11 @@ if df is None:
                     st.session_state.pop("data_err", None)
                     try:
                         ok, msg = shared_cache.publish_dataframe(df_loaded.copy(), source_label="API")
-                        st.session_state["publish_msg"] = msg if ok else None
-                    except Exception:
-                        pass
+                        st.session_state["publish_msg"] = msg
+                        st.session_state["publish_ok"] = ok
+                    except Exception as _e:
+                        st.session_state["publish_msg"] = f"Error publicando: {_e}"
+                        st.session_state["publish_ok"] = False
                     st.rerun()
                 except Exception as e:
                     st.session_state["data_err"] = str(e)
@@ -194,9 +196,11 @@ if df is None:
                 st.session_state.pop("data_err", None)
                 try:
                     ok, msg = shared_cache.publish_dataframe(df_loaded.copy(), source_label=f"Excel:{uploaded.name}")
-                    st.session_state["publish_msg"] = msg if ok else None
-                except Exception:
-                    pass
+                    st.session_state["publish_msg"] = msg
+                    st.session_state["publish_ok"] = ok
+                except Exception as _e:
+                    st.session_state["publish_msg"] = f"Error publicando: {_e}"
+                    st.session_state["publish_ok"] = False
                 st.rerun()
 
     st.stop()
@@ -209,11 +213,15 @@ with src_col1:
     st.success(f"{icon}  **Fuente activa:** {src_label}")
 with src_col2:
     if st.button("Cambiar fuente", use_container_width=True):
-        for k in ("data_df", "data_source", "data_label", "data_err", "publish_msg"):
+        for k in ("data_df", "data_source", "data_label", "data_err", "publish_msg", "publish_ok"):
             st.session_state.pop(k, None)
         st.rerun()
 if st.session_state.get("publish_msg"):
-    st.caption("🛰  " + st.session_state["publish_msg"])
+    if st.session_state.get("publish_ok"):
+        st.success("🛰  " + st.session_state["publish_msg"])
+    else:
+        st.error("⚠  Cache compartido no funciona: " + st.session_state["publish_msg"]
+                 + "  ·  Revisa los secrets `GITHUB_TOKEN` y `GITHUB_REPO` en Streamlit -> Settings -> Secrets.")
 
 cols = gr.resolve_columns(df)
 if "sede" not in cols or "status" not in cols:
