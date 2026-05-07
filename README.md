@@ -95,3 +95,13 @@ Crea una tarea que ejecute `run.bat` con la frecuencia deseada.
 - `ERROR: no se encontraron archivos .xlsx` -> Coloca el archivo en `input/` o pasa `--input`.
 - Error en `pip install` -> Verifica que Python esta en el PATH; en Windows reinstala marcando "Add to PATH".
 - PDF vacio o sin graficos -> Asegurate que la hoja se llama `data` y tiene las columnas esperadas.
+
+## Apps web disponibles
+
+| Archivo | Para quien | Comportamiento |
+|---|---|---|
+| `app.py` | Equipo operativo | Carga toda la data, filtra despues |
+| `app_managers.py` | Gerentes Generales | Pide sede primero, carga solo esa sede (mas rapido) |
+
+Ambas generan el mismo PDF. Ver `DEPLOY.md` para deploy de las dos URLs.
+Ver `PERFORMANCE.md` para detalle de las optimizaciones (parquet + pyarrow + cache).
