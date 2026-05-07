@@ -14,6 +14,7 @@ Genera el mismo PDF que app.py.
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import tempfile
 from datetime import date, datetime, timedelta
@@ -537,19 +538,49 @@ with col_a:
             st.download_button("Descargar PDF", data=pdf_bytes, file_name=fname,
                                mime="application/pdf", use_container_width=True)
 with col_b:
-    md_lines = ["# Motivos de rechazo - acciones", "",
-                f"Reporte para: **{sede_sel}**", "",
-                "| # | Motivo (ES) | Veces | % | Responsable | Accion |",
-                "|---|---|---:|---:|---|---|"]
-    for _, r in motivos.head(20).iterrows():
-        accion = (r["Accion"] or "").replace("|", "/")
-        es = (r["MotivoES"] or "").replace("|", "/")
-        md_lines.append(f"| {r['Ranking']} | {es} | {gr.fmt_int(r['Veces'])} | "
-                        f"{r['Pct']*100:.1f}% | {r['Responsable']} | {accion} |")
-    md = "\n".join(md_lines).encode("utf-8")
-    st.download_button("Descargar catalogo Motivos.md", data=md,
-                       file_name="Motivos_Acciones.md", mime="text/markdown",
-                       use_container_width=True)
+    # Excel de negados para la sede activa
+    status_col = cols.get("status")
+    if status_col:
+        s = df_f[status_col].astype(str).str.lower()
+        denied_mask = s.str.startswith("nega") | s.str.startswith("deni") | s.str.startswith("rech")
+        denied = df_f.loc[denied_mask].copy()
+    else:
+        denied = df_f.iloc[0:0]
+
+    out_df = pd.DataFrame()
+    if "venta" in cols and cols["venta"] in denied.columns:
+        out_df["id"] = denied[cols["venta"]].astype(str).values
+    else:
+        out_df["id"] = range(1, len(denied) + 1)
+    out_df["Cliente"] = denied[cols["cliente"]].astype(str).values if "cliente" in cols else ""
+    if "intento" in cols:
+        out_df["Intento"] = pd.to_datetime(denied[cols["intento"]], errors="coerce").values
+    else:
+        out_df["Intento"] = ""
+    out_df["Motivo del rechazo"] = denied[cols["motivo"]].astype(str).values if "motivo" in cols else ""
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        out_df.to_excel(writer, index=False, sheet_name="Negados")
+        ws = writer.sheets["Negados"]
+        # Auto-width simple
+        for col_idx, col_name in enumerate(out_df.columns, start=1):
+            max_len = max(
+                [len(str(col_name))]
+                + [len(str(v)) for v in out_df[col_name].head(200).tolist()]
+            )
+            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 50)
+    xlsx_bytes = buf.getvalue()
+
+    sede_tag = gr.normalize_match(sede_sel).upper().replace(" ", "_")[:30]
+    fname_xlsx = f"Negados_{sede_tag}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    st.download_button(
+        f"Descargar negados (Excel) - {len(out_df):,} filas".replace(",", "."),
+        data=xlsx_bytes,
+        file_name=fname_xlsx,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 st.caption(f"Sede: {sede_sel}  ·  Periodo: {since} a {until}  ·  "
            f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
