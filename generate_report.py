@@ -662,9 +662,9 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
     if chart_paths.get("donut"):
         left_blocks.append(Image(chart_paths["donut"], width=7.6 * cm, height=4.4 * cm))
 
-    right_blocks = [Paragraph("<b>Top 5 motivos de rechazo (en espanol)</b>", styles["Small"])]
+    right_blocks = [Paragraph("<b>Top 10 motivos de rechazo (en espanol)</b>", styles["Small"])]
     if not motivos.empty:
-        m2 = motivos.head(5).copy()
+        m2 = motivos.head(10).copy()
         m2["Pct"] = (m2["Pct"] * 100).round(1).astype(str) + "%"
         m2["MotivoES"] = m2["MotivoES"].apply(lambda x: (x[:55] + "...") if isinstance(x, str) and len(x) > 58 else x)
         m2["Veces"] = m2["Veces"].apply(fmt_int)
@@ -737,8 +737,8 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
         story.append(Spacer(1, 3))
     elif not motivos.empty:
         # Tabla de motivos con accion sugerida (texto con wrap, no truncado)
-        story.append(Paragraph("<b>Acciones por motivo (top 5)</b>", styles["Small"]))
-        ac = motivos.head(5).copy()
+        story.append(Paragraph("<b>Acciones por motivo (top 10)</b>", styles["Small"]))
+        ac = motivos.head(10).copy()
 
         cell_style = ParagraphStyle(
             "ActCell", parent=styles["Body"],
