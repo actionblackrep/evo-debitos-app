@@ -100,8 +100,9 @@ Crea una tarea que ejecute `run.bat` con la frecuencia deseada.
 
 | Archivo | Para quien | Comportamiento |
 |---|---|---|
-| `app.py` | Equipo operativo | Carga toda la data, filtra despues |
-| `app_managers.py` | Gerentes Generales | Pide sede primero, carga solo esa sede (mas rapido) |
+| `app.py` | Equipo operativo (admin) | Carga desde API o Excel. Tras cada carga publica el dataset al cache compartido (parquet en una rama del repo). |
+| `app_managers.py` | Gerentes Generales | Pide sede primero. Auto: usa API si responde; si no, lee el ultimo parquet publicado por el admin. Excel manual como ultimo recurso. |
 
-Ambas generan el mismo PDF. Ver `DEPLOY.md` para deploy de las dos URLs.
+Ambas generan el mismo PDF. Ver `DEPLOY.md` para deploy de las dos URLs y
+configuracion de secrets (incluido `GITHUB_TOKEN` para el cache compartido).
 Ver `PERFORMANCE.md` para detalle de las optimizaciones (parquet + pyarrow + cache).

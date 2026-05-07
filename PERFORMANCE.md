@@ -58,3 +58,23 @@ supera 50 MB, subirlo en partes o usar la API.
 
 Los parquet quedan en `tempfile.gettempdir()`; Streamlit Cloud rota el contenedor
 ~1 vez al dia. Para limpiar manualmente: boton "Reiniciar todo" en el sidebar.
+
+## Cache compartido entre apps (admin -> GM)
+
+La app `app_managers.py` ya no requiere que el gerente suba un Excel.
+Funciona asi:
+
+1. Admin carga datos en `app.py` (desde la API o subiendo Excel).
+2. `shared_cache.publish_dataframe()` serializa el dataframe a parquet
+   (snappy) y lo escribe en GitHub via API en la rama `data-cache`.
+3. Cuando un gerente entra a `app_managers.py`:
+   - Intenta la API EVO directamente.
+   - Si la API falla, hace `pull` del parquet publicado por el admin
+     (cache local TTL 180s) y lo usa como base de datos.
+4. El parquet remoto pesa ~1/4 del Excel original gracias a snappy + dictionary
+   encoding de columnas string. Trafico tipico: 2-5 MB por gerente que abra la
+   app despues de un cambio.
+
+Beneficio: los gerentes nunca esperan un upload de Excel. Cuando la API EVO
+empiece a funcionar de forma estable, el shared cache queda como respaldo
+silencioso (no se usa si la API responde).

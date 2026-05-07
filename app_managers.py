@@ -1,21 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 EVO - Reporte de Debitos - APP DE GERENTES GENERALES
-Flujo:
-  1. Elegir fuente (API o Excel).
-  2. Listar sedes (lectura ligera de la columna Sede/club).
-  3. Elegir sede (obligatorio).
-  4. Cargar SOLO los datos de esa sede.
-  5. Generar el mismo reporte/PDF que app.py.
 
-Optimizaciones clave:
-  - Excel se convierte a parquet una unica vez (cacheado por hash de bytes).
-  - El parquet se filtra por sede usando pyarrow (lazy, predicate pushdown).
-  - La columna de sede se lee de forma aislada para listar opciones rapido.
-  - st.cache_data reusa resultados entre interacciones del mismo usuario.
+Auto-fuente:
+  1. Intenta la API EVO (filtra en servidor).
+  2. Si la API falla, usa los datos publicados por el admin en el shared cache
+     (parquet en una rama del repo de GitHub).
+  3. Si tampoco hay shared cache, ofrece subida manual de Excel como ultimo recurso.
 
-Deploy: en Streamlit Community Cloud, configurar
-"Main file path" = `app_managers.py`. Pueden coexistir las dos apps.
+Despues de tener fuente, pide la sede (obligatorio) antes de cargar/procesar.
+Genera el mismo PDF que app.py.
 """
 from __future__ import annotations
 
@@ -28,6 +22,7 @@ import pandas as pd
 import streamlit as st
 
 import generate_report as gr
+import shared_cache
 
 st.set_page_config(
     page_title="EVO - Reporte de Debitos | Gerentes Generales",
@@ -56,6 +51,12 @@ hr {margin: 0.8rem 0;}
               color: white; padding: 14px 18px; border-radius: 8px;
               margin-bottom: 14px;}
 .sede-banner b {color: #D4AF37;}
+.src-pill {display: inline-block; padding: 2px 10px; border-radius: 999px;
+           font-size: 11px; font-weight: 600; letter-spacing: 0.4px;
+           text-transform: uppercase; margin-right: 6px;}
+.src-pill.api {background: #1F8A4C; color: white;}
+.src-pill.shared {background: #D4AF37; color: #0F2A4A;}
+.src-pill.file {background: #7A8597; color: white;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -68,11 +69,6 @@ SEDE_COL_CANDIDATES = ["Sede/club", "Sede", "Club", "sede", "club", "sede_club",
 # =========================================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def excel_bytes_to_parquet(file_bytes: bytes, name: str) -> str:
-    """One-shot Excel -> parquet conversion. Returns parquet path on disk.
-
-    Hash of bytes short-circuits re-uploads of the same file.
-    Subsequent reads use pyarrow column/predicate pushdown.
-    """
     suffix = os.path.splitext(name)[1].lower() or ".xlsx"
     digest = hashlib.md5(file_bytes).hexdigest()[:16]
     pq_path = os.path.join(tempfile.gettempdir(), f"evo_debits_{digest}.parquet")
@@ -142,19 +138,23 @@ def api_list_sedes(api_url: str, api_key: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def api_load_for_sede(api_url: str, api_key: str, sede: str) -> pd.DataFrame:
-    """Try to push sede filter to API; fallback to client-side filter if needed."""
     try:
         df = gr.fetch_from_api(api_url, api_key, sede=sede)
     except Exception:
         df = gr.fetch_from_api(api_url, api_key)
     cols = gr.resolve_columns(df)
     if "sede" in cols and len(df):
-        from generate_report import normalize_match
-        target = normalize_match(sede)
-        mask = df[cols["sede"]].astype(str).map(normalize_match) == target
+        target = gr.normalize_match(sede)
+        mask = df[cols["sede"]].astype(str).map(gr.normalize_match) == target
         if mask.sum() > 0:
             df = df.loc[mask].copy()
     return df
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def shared_pull_path() -> str | None:
+    """Cached pull from GitHub shared cache. Returns local parquet path or None."""
+    return shared_cache.pull_parquet()
 
 
 # =========================================================
@@ -218,7 +218,9 @@ def metric_card(label, value, sub=None, kind="default"):
 
 
 def reset_state():
-    for k in list(st.session_state.keys()):
+    keys = ["source", "sedes_api", "sedes_shared", "shared_pq_path", "shared_sede_col",
+            "api_error", "shared_error", "used_fallback", "sede_pick", "upl"]
+    for k in keys:
         st.session_state.pop(k, None)
 
 
@@ -230,99 +232,136 @@ with st.sidebar:
     st.caption("Solo administradores.")
     api_url = st.text_input("URL del endpoint", value=gr.DEFAULT_API_URL)
     api_key = st.text_input("API Key", value=gr.DEFAULT_API_KEY, type="password")
+    if st.button("Forzar reconexion API", use_container_width=True):
+        reset_state()
+        st.cache_data.clear()
+        st.rerun()
     if st.button("Reiniciar todo", use_container_width=True):
         reset_state()
         st.rerun()
     st.markdown("---")
-    st.caption("Vista de Gerentes Generales. La sede es obligatoria; "
-               "esto reduce el tiempo de carga.")
+    st.caption("Fuente actual:")
+    src = st.session_state.get("source")
+    if src == "api":
+        st.markdown("<span class='src-pill api'>API EVO</span>", unsafe_allow_html=True)
+    elif src == "shared":
+        st.markdown("<span class='src-pill shared'>Datos del admin</span>", unsafe_allow_html=True)
+    elif src == "file":
+        st.markdown("<span class='src-pill file'>Excel manual</span>", unsafe_allow_html=True)
+    else:
+        st.caption("(sin fuente todavia)")
+    st.markdown("---")
+    st.caption("Vista de Gerentes Generales. La sede es obligatoria.")
 
 
 # =========================================================
 # Header
 # =========================================================
 st.markdown("# 🏢 EVO - Reporte de Debitos (Gerentes Generales)")
-st.caption("Selecciona la sede ANTES de cargar. Solo se procesan los datos de esa sede.")
+st.caption("La fuente se selecciona automaticamente: API si responde, "
+           "si no, los datos publicados por el admin.")
 
 
 # =========================================================
-# Step 1 - source picker
+# Auto-detectar fuente
 # =========================================================
 if "source" not in st.session_state:
-    st.markdown("### 1. ¿De donde tomamos los datos?")
-    col_a, col_b = st.columns(2, gap="large")
-    with col_a:
-        st.markdown("#### 🌐 API EVO")
-        st.caption("Recomendado. Filtra en el servidor.")
-        if st.button("Usar API", type="primary", use_container_width=True, key="src_api"):
-            st.session_state["source"] = "api"
-            st.rerun()
-    with col_b:
-        st.markdown("#### 📄 Excel")
-        st.caption("Sube .xlsx/.xlsm con hoja `data`.")
-        if st.button("Subir Excel", use_container_width=True, key="src_xls"):
+    api_err = None
+    with st.spinner("Conectando a la API EVO..."):
+        try:
+            sedes_api = api_list_sedes(api_url, api_key)
+            if sedes_api:
+                st.session_state["source"] = "api"
+                st.session_state["sedes_api"] = sedes_api
+                st.rerun()
+        except Exception as e:
+            api_err = str(e)[:300]
+            st.session_state["api_error"] = api_err
+
+    with st.spinner("Buscando datos publicados por el admin..."):
+        try:
+            pq_path = shared_pull_path()
+            if pq_path:
+                sede_col, sedes_shared = parquet_list_sedes(pq_path)
+                if sedes_shared:
+                    st.session_state["source"] = "shared"
+                    st.session_state["shared_pq_path"] = pq_path
+                    st.session_state["shared_sede_col"] = sede_col
+                    st.session_state["sedes_shared"] = sedes_shared
+                    if api_err:
+                        st.session_state["used_fallback"] = True
+                    st.rerun()
+        except Exception as e:
+            st.session_state["shared_error"] = str(e)[:300]
+
+    # Manual upload as last resort
+    st.warning(
+        "No hay datos disponibles automaticamente. "
+        "La API no respondio y el admin aun no ha publicado un archivo."
+    )
+    if st.session_state.get("api_error"):
+        with st.expander("Detalle del error de API"):
+            st.code(st.session_state["api_error"])
+    if not shared_cache.is_configured():
+        st.info(
+            "El cache compartido NO esta configurado. Pide al admin que agregue "
+            "los secrets `GITHUB_TOKEN` y `GITHUB_REPO` en Streamlit Community Cloud."
+        )
+    st.markdown("#### Subir un Excel manualmente")
+    uploaded = st.file_uploader("Archivo .xlsx", type=["xlsx", "xlsm"],
+                                key="upl_fallback",
+                                label_visibility="collapsed")
+    if uploaded is not None:
+        with st.spinner("Indexando archivo..."):
+            pq_path = excel_bytes_to_parquet(uploaded.getvalue(), uploaded.name)
+            sede_col, sedes_local = parquet_list_sedes(pq_path)
+        if sedes_local:
             st.session_state["source"] = "file"
+            st.session_state["shared_pq_path"] = pq_path
+            st.session_state["shared_sede_col"] = sede_col
+            st.session_state["sedes_shared"] = sedes_local
             st.rerun()
+        else:
+            st.error("No se detecto columna de sede en el archivo.")
     st.stop()
 
+
+# =========================================================
+# Banner de fuente
+# =========================================================
 source = st.session_state["source"]
-
-
-# =========================================================
-# Step 2 - list sedes
-# =========================================================
-sedes_options = []
-sede_col_name = None
-pq_path = None
-
 if source == "api":
-    if "sedes_api" not in st.session_state:
-        with st.spinner("Listando sedes desde la API..."):
-            try:
-                st.session_state["sedes_api"] = api_list_sedes(api_url, api_key)
-            except Exception as e:
-                st.error(f"Error consultando la API: {e}")
-                if st.button("Volver"):
-                    reset_state()
-                    st.rerun()
-                st.stop()
-    sedes_options = st.session_state.get("sedes_api", [])
-
+    st.success("Fuente: **API EVO** (datos en vivo).")
+elif source == "shared":
+    meta = shared_cache.remote_meta()
+    if st.session_state.get("used_fallback"):
+        msg = "API no disponible. Usando **datos publicados por el admin**."
+    else:
+        msg = "Usando **datos publicados por el admin**."
+    if meta:
+        msg += f"  ·  Ultima publicacion: `{meta['date'][:16]}Z` ({meta['sha']})"
+    st.info(msg)
 elif source == "file":
-    uploaded = st.file_uploader("Archivo .xlsx", type=["xlsx", "xlsm"],
-                                key="upl",
-                                label_visibility="collapsed")
-    if uploaded is None:
-        st.info("Sube el archivo de debitos para continuar.")
-        if st.button("Volver"):
-            reset_state()
-            st.rerun()
-        st.stop()
-
-    with st.spinner("Indexando archivo (una sola vez por archivo)..."):
-        pq_path = excel_bytes_to_parquet(uploaded.getvalue(), uploaded.name)
-        sede_col_name, sedes_options = parquet_list_sedes(pq_path)
-
-    if not sede_col_name:
-        st.error("No se encontro columna de sede en el archivo. "
-                 "Columnas esperadas: Sede/club, Sede, Club.")
-        if st.button("Volver"):
-            reset_state()
-            st.rerun()
-        st.stop()
+    st.info("Fuente: **Excel local** (subido manualmente, no compartido).")
 
 
 # =========================================================
-# Step 3 - sede picker (BLOCKS until chosen)
+# Step - sede picker
 # =========================================================
+if source == "api":
+    sedes_options = st.session_state.get("sedes_api", [])
+else:
+    sedes_options = st.session_state.get("sedes_shared", [])
+
 if not sedes_options:
-    st.error("No se obtuvieron sedes. Verifica la fuente de datos.")
-    if st.button("Volver"):
+    st.error("No se obtuvieron sedes desde la fuente activa.")
+    if st.button("Reintentar"):
         reset_state()
+        st.cache_data.clear()
         st.rerun()
     st.stop()
 
-st.markdown("### 2. Selecciona la sede")
+st.markdown("### Selecciona la sede")
 sede_sel = st.selectbox(
     "Sede / Club (obligatorio)",
     ["-- Selecciona una sede --"] + sedes_options,
@@ -339,13 +378,15 @@ if sede_sel == "-- Selecciona una sede --":
 
 
 # =========================================================
-# Step 4 - load filtered data
+# Carga filtrada
 # =========================================================
 with st.spinner(f"Cargando registros de '{sede_sel}'..."):
     if source == "api":
         df = api_load_for_sede(api_url, api_key, sede_sel)
     else:
-        df = parquet_filter_by_sede(pq_path, sede_col_name, sede_sel)
+        pq_path = st.session_state["shared_pq_path"]
+        sede_col = st.session_state["shared_sede_col"]
+        df = parquet_filter_by_sede(pq_path, sede_col, sede_sel)
 
 if df is None or df.empty:
     st.warning(f"No hay registros para la sede '{sede_sel}'.")
@@ -363,7 +404,7 @@ st.markdown(
 
 
 # =========================================================
-# Step 5 - date filter + pipeline
+# Date filter + pipeline
 # =========================================================
 cols = gr.resolve_columns(df)
 date_col = cols.get("intento")

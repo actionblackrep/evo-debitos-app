@@ -20,6 +20,7 @@ import streamlit as st
 
 import generate_report as gr
 from motivos import MOTIVO_CATALOG, lookup_motivo, translate_motivo
+import shared_cache
 
 
 st.set_page_config(
@@ -166,6 +167,11 @@ if df is None:
                     st.session_state["data_source"] = "api"
                     st.session_state["data_label"] = f"API ({len(df_loaded):,} registros)"
                     st.session_state.pop("data_err", None)
+                    try:
+                        ok, msg = shared_cache.publish_dataframe(df_loaded.copy(), source_label="API")
+                        st.session_state["publish_msg"] = msg if ok else None
+                    except Exception:
+                        pass
                     st.rerun()
                 except Exception as e:
                     st.session_state["data_err"] = str(e)
@@ -186,6 +192,11 @@ if df is None:
                 st.session_state["data_source"] = "file"
                 st.session_state["data_label"] = f"Archivo: {uploaded.name} ({len(df_loaded):,} registros)"
                 st.session_state.pop("data_err", None)
+                try:
+                    ok, msg = shared_cache.publish_dataframe(df_loaded.copy(), source_label=f"Excel:{uploaded.name}")
+                    st.session_state["publish_msg"] = msg if ok else None
+                except Exception:
+                    pass
                 st.rerun()
 
     st.stop()
@@ -198,9 +209,11 @@ with src_col1:
     st.success(f"{icon}  **Fuente activa:** {src_label}")
 with src_col2:
     if st.button("Cambiar fuente", use_container_width=True):
-        for k in ("data_df", "data_source", "data_label", "data_err"):
+        for k in ("data_df", "data_source", "data_label", "data_err", "publish_msg"):
             st.session_state.pop(k, None)
         st.rerun()
+if st.session_state.get("publish_msg"):
+    st.caption("🛰  " + st.session_state["publish_msg"])
 
 cols = gr.resolve_columns(df)
 if "sede" not in cols or "status" not in cols:
