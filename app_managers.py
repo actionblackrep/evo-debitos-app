@@ -624,27 +624,44 @@ with col_b:
     else:
         denied = df_f.iloc[0:0]
 
-    out_df = pd.DataFrame()
-    # Buscar columna user-id (no la ID de la venta)
+    # Build working frame with the raw columns we need
+    work = pd.DataFrame()
     id_candidates = ["id", "ID", "Id", "user_id", "userId", "userid",
                      "id_usuario", "ID_usuario", "idUsuario", "Cliente_id", "id_cliente"]
     id_col = next((c for c in id_candidates if c in denied.columns), None)
     if id_col:
-        out_df["id"] = denied[id_col].astype(str).values
+        work["id"] = denied[id_col].astype(str).values
     else:
-        out_df["id"] = range(1, len(denied) + 1)
-    out_df["Cliente"] = denied[cols["cliente"]].astype(str).values if "cliente" in cols else ""
+        work["id"] = [str(i) for i in range(1, len(denied) + 1)]
+    work["Cliente"] = denied[cols["cliente"]].astype(str).values if "cliente" in cols else ""
     if "intento" in cols:
-        out_df["Intento"] = pd.to_datetime(denied[cols["intento"]], errors="coerce").values
+        work["Intento"] = pd.to_datetime(denied[cols["intento"]], errors="coerce").values
     else:
-        out_df["Intento"] = ""
-    out_df["Motivo del rechazo"] = denied[cols["motivo"]].astype(str).values if "motivo" in cols else ""
-    if len(out_df) > 0 and "Motivo del rechazo" in out_df.columns:
-        out_df["Total intentos"] = (
-            out_df.groupby("Motivo del rechazo")["Motivo del rechazo"].transform("count").astype(int)
+        work["Intento"] = pd.NaT
+    work["Motivo del rechazo"] = denied[cols["motivo"]].astype(str).values if "motivo" in cols else ""
+
+    # Aggregate: one row per (id, Motivo del rechazo).
+    # Total intentos = numero de veces que ese usuario tuvo ese motivo en el rango activo.
+    # Cliente: primer valor del grupo. Intento: ultima fecha (max) del grupo.
+    if len(work) > 0:
+        out_df = (
+            work.groupby(["id", "Motivo del rechazo"], dropna=False, sort=False)
+            .agg(
+                Cliente=("Cliente", "first"),
+                Intento=("Intento", "max"),
+                Total_intentos=("Motivo del rechazo", "size"),
+            )
+            .reset_index()
+            .rename(columns={"Total_intentos": "Total intentos"})
         )
+        out_df = out_df[["id", "Cliente", "Intento", "Motivo del rechazo", "Total intentos"]]
+        out_df = out_df.sort_values(
+            ["Total intentos", "id"], ascending=[False, True]
+        ).reset_index(drop=True)
     else:
-        out_df["Total intentos"] = 0
+        out_df = pd.DataFrame(
+            columns=["id", "Cliente", "Intento", "Motivo del rechazo", "Total intentos"]
+        )
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
