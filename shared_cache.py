@@ -216,18 +216,37 @@ def remote_meta() -> Optional[dict]:
         return None
 
 
+SEDE_COL_CANDIDATES = ["Sede/club", "Sede", "Club", "sede", "club", "sede_club", "branch"]
+
+
+def _canonicalize_string_columns(df) -> None:
+    """In-place: strip whitespace + NFKC normalize on all string-like columns.
+
+    Critical for sede column: pyarrow predicate pushdown is byte-exact and a
+    single trailing space silently drops entire sedes from filtered results.
+    """
+    import unicodedata as _ud
+    for col in df.columns:
+        try:
+            s = df[col]
+            if s.dtype == object or str(s.dtype) == "string":
+                df[col] = (
+                    s.astype("string")
+                    .map(lambda x: _ud.normalize("NFKC", x).strip() if isinstance(x, str) else x)
+                )
+        except Exception:
+            continue
+
+
 def publish_dataframe(df, source_label: str = "") -> tuple[bool, str]:
     """Save df to a temp parquet and push to cache. Returns (ok, message)."""
     if not is_configured():
         return False, "Cache compartido no configurado (faltan GITHUB_TOKEN / GITHUB_REPO)."
     pq_path = os.path.join(tempfile.gettempdir(), "evo_debits_publish.parquet")
     try:
-        # Reduce object dtype bloat before serializing
-        try:
-            for col in df.select_dtypes(include="object").columns:
-                df[col] = df[col].astype("string")
-        except Exception:
-            pass
+        # Canonicalize ALL string columns (specially sede) so downstream pyarrow
+        # filters do byte-exact match against clean values.
+        _canonicalize_string_columns(df)
         df.to_parquet(pq_path, index=False, compression="snappy")
     except Exception as e:
         return False, f"No se pudo serializar a parquet: {e}"

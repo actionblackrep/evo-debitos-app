@@ -80,11 +80,19 @@ def excel_bytes_to_parquet(file_bytes: bytes, name: str) -> str:
         xpath = f.name
     try:
         df = gr.load_data([xpath])
-        for c in df.select_dtypes(include="object").columns:
+        # Canonicalize string columns: strip whitespace + NFKC normalize.
+        # Required so pyarrow filters can byte-match the same value the dropdown shows.
+        import unicodedata as _ud
+        for c in df.columns:
             try:
-                df[c] = df[c].astype("string")
+                s = df[c]
+                if s.dtype == object or str(s.dtype) == "string":
+                    df[c] = (
+                        s.astype("string")
+                        .map(lambda x: _ud.normalize("NFKC", x).strip() if isinstance(x, str) else x)
+                    )
             except Exception:
-                pass
+                continue
         df.to_parquet(pq_path, index=False, compression="snappy")
     finally:
         try:
@@ -125,7 +133,20 @@ def parquet_list_sedes(pq_path: str):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def parquet_filter_by_sede(pq_path: str, sede_col: str, sede: str) -> pd.DataFrame:
-    return pd.read_parquet(pq_path, filters=[(sede_col, "=", sede)])
+    """Filter parquet by sede.
+
+    1) Try exact-match via pyarrow predicate pushdown (fast).
+    2) If 0 rows, fallback to full scan with whitespace-stripped comparison
+       to handle parquets that were not canonicalized at write time.
+    """
+    df = pd.read_parquet(pq_path, filters=[(sede_col, "=", sede)])
+    if not df.empty:
+        return df
+    # Fallback path: read full and compare stripped strings
+    full = pd.read_parquet(pq_path)
+    target = (sede or "").strip()
+    mask = full[sede_col].astype(str).str.strip() == target
+    return full.loc[mask].copy()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -618,6 +639,12 @@ with col_b:
     else:
         out_df["Intento"] = ""
     out_df["Motivo del rechazo"] = denied[cols["motivo"]].astype(str).values if "motivo" in cols else ""
+    if len(out_df) > 0 and "Motivo del rechazo" in out_df.columns:
+        out_df["Total intentos"] = (
+            out_df.groupby("Motivo del rechazo")["Motivo del rechazo"].transform("count").astype(int)
+        )
+    else:
+        out_df["Total intentos"] = 0
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
