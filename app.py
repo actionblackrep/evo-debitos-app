@@ -102,7 +102,28 @@ def run_pipeline(df, args_sede, args_since, args_until):
     return df, cols, summary, sedes, motivos, tipos, marcas, daily, sede_label
 
 
+def robust_period(df, cols):
+    """Returns (date_min, date_max) ignoring 1% of outliers on each tail."""
+    if "intento" not in cols:
+        return None, None
+    dts = pd.to_datetime(df[cols["intento"]], errors="coerce").dropna()
+    if dts.empty:
+        return None, None
+    if len(dts) >= 50:
+        lo = dts.quantile(0.01)
+        hi = dts.quantile(0.99)
+    else:
+        lo, hi = dts.min(), dts.max()
+    return lo, hi
+
+
 def build_pdf_bytes(df, cols, summary, sedes, motivos, tipos, marcas, daily, sede_label):
+    # Periodo robusto en el header: ignora fechas aisladas fuera del rango real
+    lo, hi = robust_period(df, cols)
+    if lo is not None:
+        summary = dict(summary)
+        summary["date_min"] = lo
+        summary["date_max"] = hi
     with tempfile.TemporaryDirectory() as tmp:
         chart_dir = os.path.join(tmp, "charts")
         os.makedirs(chart_dir, exist_ok=True)
