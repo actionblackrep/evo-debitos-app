@@ -357,9 +357,18 @@ def setup_mpl():
 
 def chart_donut_status(s, path):
     fig, ax = plt.subplots(figsize=(4.0, 2.6), dpi=180)
-    vals = [s["approved"], s["denied"]]
+    vals = [s.get("approved", 0) or 0, s.get("denied", 0) or 0]
     labels = ["Aprobado", "Negado"]
     colors_ = ["#1F8A4C", "#C0392B"]
+    if sum(vals) <= 0:
+        ax.text(0.5, 0.5, "Sin intentos clasificados", ha="center", va="center",
+                fontsize=11, color="#7A8597", transform=ax.transAxes)
+        ax.set_axis_off()
+        ax.set_title("Resultado global de intentos")
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        return
     wedges, _ = ax.pie(vals, colors=colors_, startangle=90,
                        wedgeprops=dict(width=0.42, edgecolor="white", linewidth=2))
     rate = s["success_rate"] * 100

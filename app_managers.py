@@ -487,6 +487,11 @@ with st.spinner("Calculando metricas..."):
     df_f, cols, summary, sedes, motivos, tipos, marcas, daily = run_pipeline_for_sede(
         df, sede_sel, since.isoformat(), until.isoformat())
 
+if df_f.empty or summary.get("total", 0) == 0:
+    st.warning(f"No hay registros para '{sede_sel}' entre {since} y {until}. "
+               "Amplia el rango de fechas para continuar.")
+    st.stop()
+
 
 # =========================================================
 # KPIs
@@ -515,18 +520,26 @@ left, right = st.columns([1.2, 2])
 with left:
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(4.5, 3.0))
-    ax.pie([summary["approved"], summary["denied"]],
-           colors=["#1F8A4C", "#C0392B"], startangle=90,
-           wedgeprops=dict(width=0.42, edgecolor="white", linewidth=2))
-    ax.text(0, 0.05, f"{summary['success_rate']*100:.1f}%",
-            ha="center", va="center", fontsize=22, fontweight="bold", color="#0F2A4A")
-    ax.text(0, -0.18, "Tasa de exito", ha="center", va="center",
-            fontsize=9, color="#7A8597")
-    ax.legend(["Aprobado", "Negado"], loc="lower center",
-              bbox_to_anchor=(0.5, -0.05), ncol=2, frameon=False)
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+    pie_total = (summary.get("approved", 0) or 0) + (summary.get("denied", 0) or 0)
+    if pie_total <= 0:
+        ax.text(0.5, 0.5, "Sin intentos clasificados", ha="center", va="center",
+                fontsize=10, color="#7A8597", transform=ax.transAxes)
+        ax.set_axis_off()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+    else:
+        ax.pie([summary["approved"], summary["denied"]],
+               colors=["#1F8A4C", "#C0392B"], startangle=90,
+               wedgeprops=dict(width=0.42, edgecolor="white", linewidth=2))
+        ax.text(0, 0.05, f"{summary['success_rate']*100:.1f}%",
+                ha="center", va="center", fontsize=22, fontweight="bold", color="#0F2A4A")
+        ax.text(0, -0.18, "Tasa de exito", ha="center", va="center",
+                fontsize=9, color="#7A8597")
+        ax.legend(["Aprobado", "Negado"], loc="lower center",
+                  bbox_to_anchor=(0.5, -0.05), ncol=2, frameon=False)
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
 with right:
     if not daily.empty and len(daily) > 1:
         import matplotlib.pyplot as plt
