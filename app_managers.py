@@ -233,6 +233,15 @@ with st.sidebar:
     st.caption("Solo administradores.")
     api_url = st.text_input("URL del endpoint", value=gr.DEFAULT_API_URL)
     api_key = st.text_input("API Key", value=gr.DEFAULT_API_KEY, type="password")
+    if st.button("Recargar datos del admin", type="primary", use_container_width=True,
+                 help="Borra todos los caches locales y vuelve a leer la API y el cache compartido."):
+        reset_state()
+        st.cache_data.clear()
+        try:
+            shared_pull_path.clear()
+        except Exception:
+            pass
+        st.rerun()
     if st.button("Forzar reconexion API", use_container_width=True):
         reset_state()
         st.cache_data.clear()
@@ -433,6 +442,19 @@ if date_col:
         fmax = date.today()
 else:
     fmin = fmax = date.today()
+
+# Banner con rango real de los datos cargados + fecha de publicacion del admin
+range_msg = f"Rango disponible en los datos: **{fmin}** a **{fmax}**"
+if source == "shared":
+    meta = shared_cache.remote_meta()
+    if meta:
+        range_msg += f"  ·  Publicado por admin: `{meta['date'][:16]}Z`"
+elif source == "api":
+    range_msg += "  ·  Origen: API EVO en vivo"
+elif source == "file":
+    range_msg += "  ·  Origen: Excel local manual"
+range_msg += "  ·  Si no es el rango esperado, presiona **Recargar datos** en la sidebar."
+st.caption(range_msg)
 
 c1, c2 = st.columns(2)
 with c1:

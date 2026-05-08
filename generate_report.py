@@ -622,12 +622,31 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
         # Linea 1: marca + titulo
         canv.setFont("Helvetica-Bold", 11.5)
         canv.drawString(1.0 * cm, h - 0.50 * cm, "REPORTE DEBITOS - EVO")
-        # Linea 2: sede a la izquierda, periodo y fecha de generacion a la derecha
-        canv.setFont("Helvetica-Bold", 9)
-        canv.drawString(1.0 * cm, h - 1.05 * cm, f"Sede: {sede_label.upper()}")
-        canv.setFont("Helvetica", 8.5)
-        canv.drawRightString(w - 1.0 * cm, h - 1.05 * cm,
-                             f"{period_str}  ·  {generated_str}")
+
+        # Linea 2: sede izquierda, periodo+fecha derecha. Auto-fit defensivo.
+        right_text = f"{period_str}  ·  {generated_str}"
+        right_font = "Helvetica"
+        right_size = 8.5
+        right_w = canv.stringWidth(right_text, right_font, right_size)
+
+        sede_text = f"Sede: {sede_label.upper()}"
+        sede_font = "Helvetica-Bold"
+        sede_size = 9.0
+        # Espacio disponible para sede = ancho - margenes - ancho de la fecha - gap
+        avail = (w - 2.0 * cm) - right_w - (0.6 * cm)
+        # Reduce font hasta que quepa, minimo 7.5
+        while sede_size > 7.5 and canv.stringWidth(sede_text, sede_font, sede_size) > avail:
+            sede_size -= 0.5
+        # Si aun no cabe, trunca con elipsis
+        while canv.stringWidth(sede_text, sede_font, sede_size) > avail and len(sede_text) > 12:
+            sede_text = sede_text[:-2] + "..."
+            sede_text = sede_text.rstrip(".") + "..." if not sede_text.endswith("...") else sede_text
+
+        canv.setFont(sede_font, sede_size)
+        canv.drawString(1.0 * cm, h - 1.05 * cm, sede_text)
+        canv.setFont(right_font, right_size)
+        canv.drawRightString(w - 1.0 * cm, h - 1.05 * cm, right_text)
+
         canv.setFillColor(GREY)
         canv.setFont("Helvetica", 7)
         canv.drawCentredString(w / 2, 0.4 * cm, "Confidencial - Uso interno")
