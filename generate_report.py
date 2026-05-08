@@ -599,7 +599,7 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
     """Single-page A4 management report."""
     doc = BaseDocTemplate(out_path, pagesize=A4,
                           leftMargin=1.0 * cm, rightMargin=1.0 * cm,
-                          topMargin=1.0 * cm, bottomMargin=0.8 * cm,
+                          topMargin=1.4 * cm, bottomMargin=0.8 * cm,
                           title="Reporte de Debitos", author="EVO Analytics")
     frame = Frame(doc.leftMargin, doc.bottomMargin,
                   A4[0] - doc.leftMargin - doc.rightMargin,
@@ -613,16 +613,21 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
     def page_decor(canv, d):
         canv.saveState()
         w, h = A4
+        # Banner de 1.3 cm con dos lineas para evitar overlap titulo/fecha
         canv.setFillColor(PRIMARY)
-        canv.rect(0, h - 1.0 * cm, w, 1.0 * cm, fill=1, stroke=0)
+        canv.rect(0, h - 1.3 * cm, w, 1.3 * cm, fill=1, stroke=0)
         canv.setFillColor(ACCENT)
-        canv.rect(0, h - 1.05 * cm, w, 0.05 * cm, fill=1, stroke=0)
+        canv.rect(0, h - 1.35 * cm, w, 0.05 * cm, fill=1, stroke=0)
         canv.setFillColor(colors.white)
-        canv.setFont("Helvetica-Bold", 12)
-        canv.drawString(1.0 * cm, h - 0.65 * cm,
-                        f"EVO  ·  REPORTE GERENCIAL DE DEBITOS  ·  {sede_label.upper()}")
+        # Linea 1: marca + titulo
+        canv.setFont("Helvetica-Bold", 11.5)
+        canv.drawString(1.0 * cm, h - 0.50 * cm, "REPORTE DEBITOS - EVO")
+        # Linea 2: sede a la izquierda, periodo y fecha de generacion a la derecha
+        canv.setFont("Helvetica-Bold", 9)
+        canv.drawString(1.0 * cm, h - 1.05 * cm, f"Sede: {sede_label.upper()}")
         canv.setFont("Helvetica", 8.5)
-        canv.drawRightString(w - 1.0 * cm, h - 0.65 * cm, f"{period_str}  ·  {generated_str}")
+        canv.drawRightString(w - 1.0 * cm, h - 1.05 * cm,
+                             f"{period_str}  ·  {generated_str}")
         canv.setFillColor(GREY)
         canv.setFont("Helvetica", 7)
         canv.drawCentredString(w / 2, 0.4 * cm, "Confidencial - Uso interno")
