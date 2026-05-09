@@ -84,19 +84,7 @@ def excel_bytes_to_parquet(file_bytes: bytes, name: str) -> str:
         xpath = f.name
     try:
         df = gr.load_data([xpath])
-        # Canonicalize string columns: strip whitespace + NFKC normalize.
-        # Required so pyarrow filters can byte-match the same value the dropdown shows.
-        import unicodedata as _ud
-        for c in df.columns:
-            try:
-                s = df[c]
-                if s.dtype == object or str(s.dtype) == "string":
-                    df[c] = (
-                        s.astype("string")
-                        .map(lambda x: _ud.normalize("NFKC", x).strip() if isinstance(x, str) else x)
-                    )
-            except Exception:
-                continue
+        _vectorize_canonicalize(df)
         df.to_parquet(pq_path, index=False, compression="snappy")
     finally:
         try:
@@ -187,12 +175,31 @@ def shared_pull_path() -> str | None:
 # =========================================================
 # API v2 (manual connect, multi-header, month param)
 # =========================================================
+# Hard cap to protect Streamlit free-tier (1GB RAM). Adjust if endpoint grows.
+MAX_RECORDS = 300_000
+
+
+def _vectorize_canonicalize(df: pd.DataFrame) -> None:
+    """Strip whitespace on all string-like columns. In-place. Vectorized.
+
+    Replaces the previous .map(lambda) approach which was O(rows*cols) Python
+    overhead and OOM-prone on 100k+ rows.
+    """
+    for c in df.columns:
+        s = df[c]
+        try:
+            if s.dtype == object or str(s.dtype) == "string":
+                df[c] = s.astype("string").str.strip()
+        except Exception:
+            continue
+
+
 def _fetch_debitos_v2(url: str, token: str, month: str | None,
-                      page_size: int = 5000, timeout: int = 60) -> pd.DataFrame:
+                      page_size: int = 10000, timeout: int = 60) -> pd.DataFrame:
     """Fetch debitos with `month=YYYY-MM`, trying multiple auth header variants.
 
-    The token is read server-side (st.secrets / env). It NEVER travels through
-    the UI. Returns a DataFrame; raises RuntimeError on failure.
+    Token never reaches the UI. Records cap at MAX_RECORDS to prevent OOM.
+    Uses pd.DataFrame() (much faster than json_normalize on flat records).
     """
     if not month:
         month = datetime.now().strftime("%Y-%m")
@@ -209,10 +216,11 @@ def _fetch_debitos_v2(url: str, token: str, month: str | None,
     for hv in header_variants:
         headers = dict(hv)
         headers["Accept"] = "application/json"
-        headers["User-Agent"] = "evo-debitos-gm/2.0"
+        headers["User-Agent"] = "evo-debitos-gm/2.1"
         rows: list = []
         ok = False
         page = 1
+        max_pages = (MAX_RECORDS // page_size) + 1
         while True:
             qs = dict(base_qs)
             qs["page"] = page
@@ -247,14 +255,21 @@ def _fetch_debitos_v2(url: str, token: str, month: str | None,
             if not recs:
                 break
             rows.extend(recs)
+            if len(rows) >= MAX_RECORDS:
+                # Hard stop. Better to return partial than crash.
+                break
             if len(recs) < page_size:
                 break
             page += 1
-            if page > 50:
+            if page > max_pages:
                 break
 
         if ok and rows:
-            df = pd.json_normalize(rows)
+            # Use pd.DataFrame on flat records (much faster than json_normalize).
+            try:
+                df = pd.DataFrame(rows)
+            except Exception:
+                df = pd.json_normalize(rows)
             df["__source_file__"] = f"api:{url}?month={month}"
             return df
 
@@ -265,22 +280,10 @@ def _fetch_debitos_v2(url: str, token: str, month: str | None,
 def cached_fetch_api(url: str, month: str) -> str:
     """Fetch via API and persist as parquet on disk. Returns parquet path.
 
-    Token is read internally from gr.DEFAULT_API_KEY; never as a function arg
-    so it does not appear in the cache key visible in error traces.
+    Token is read internally from gr.DEFAULT_API_KEY; never appears in args.
     """
     df = _fetch_debitos_v2(url, gr.DEFAULT_API_KEY, month=month)
-    # Canonicalize string columns (strip + NFKC) before persisting
-    import unicodedata as _ud
-    for c in df.columns:
-        try:
-            s = df[c]
-            if s.dtype == object or str(s.dtype) == "string":
-                df[c] = (
-                    s.astype("string")
-                    .map(lambda x: _ud.normalize("NFKC", x).strip() if isinstance(x, str) else x)
-                )
-        except Exception:
-            continue
+    _vectorize_canonicalize(df)
     h = hashlib.md5(f"{url}::{month}".encode()).hexdigest()[:16]
     pq_path = os.path.join(tempfile.gettempdir(), f"evo_debits_api_{h}.parquet")
     df.to_parquet(pq_path, index=False, compression="snappy")
@@ -808,33 +811,55 @@ with col_b:
     else:
         work["id"] = [str(i) for i in range(1, len(denied) + 1)]
     work["Cliente"] = denied[cols["cliente"]].astype(str).values if "cliente" in cols else ""
+
+    # Detectar columnas de contacto que el endpoint ahora retorna al final
+    EMAIL_CANDS = ["email", "Email", "EMAIL", "correo", "Correo", "mail", "e-mail"]
+    PHONE_CANDS = ["phone", "Phone", "PHONE", "telefono", "Telefono", "TELEFONO",
+                   "celular", "Celular", "movil", "Movil", "tel"]
+    email_col = next((c for c in EMAIL_CANDS if c in denied.columns), None)
+    phone_col = next((c for c in PHONE_CANDS if c in denied.columns), None)
+    work["email"] = denied[email_col].astype(str).values if email_col else ""
+    work["phone"] = denied[phone_col].astype(str).values if phone_col else ""
+
     if "intento" in cols:
         work["Intento"] = pd.to_datetime(denied[cols["intento"]], errors="coerce").values
     else:
         work["Intento"] = pd.NaT
     work["Motivo del rechazo"] = denied[cols["motivo"]].astype(str).values if "motivo" in cols else ""
 
+    # Helper para "first non-null/non-empty" en columnas de contacto
+    def _first_non_empty(series: pd.Series):
+        s = series.astype(str).replace({"nan": "", "None": "", "NaN": ""}).str.strip()
+        for v in s:
+            if v:
+                return v
+        return ""
+
     # Aggregate: one row per (id, Motivo del rechazo).
     # Total intentos = numero de veces que ese usuario tuvo ese motivo en el rango activo.
-    # Cliente: primer valor del grupo. Intento: ultima fecha (max) del grupo.
+    # Cliente / email / phone: primer valor no-vacio del grupo. Intento: max del grupo.
     if len(work) > 0:
         out_df = (
             work.groupby(["id", "Motivo del rechazo"], dropna=False, sort=False)
             .agg(
                 Cliente=("Cliente", "first"),
+                email=("email", _first_non_empty),
+                phone=("phone", _first_non_empty),
                 Intento=("Intento", "max"),
                 Total_intentos=("Motivo del rechazo", "size"),
             )
             .reset_index()
             .rename(columns={"Total_intentos": "Total intentos"})
         )
-        out_df = out_df[["id", "Cliente", "Intento", "Motivo del rechazo", "Total intentos"]]
+        out_df = out_df[["id", "Cliente", "email", "phone", "Intento",
+                         "Motivo del rechazo", "Total intentos"]]
         out_df = out_df.sort_values(
             ["Total intentos", "id"], ascending=[False, True]
         ).reset_index(drop=True)
     else:
         out_df = pd.DataFrame(
-            columns=["id", "Cliente", "Intento", "Motivo del rechazo", "Total intentos"]
+            columns=["id", "Cliente", "email", "phone", "Intento",
+                     "Motivo del rechazo", "Total intentos"]
         )
 
     buf = io.BytesIO()

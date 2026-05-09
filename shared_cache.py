@@ -220,20 +220,16 @@ SEDE_COL_CANDIDATES = ["Sede/club", "Sede", "Club", "sede", "club", "sede_club",
 
 
 def _canonicalize_string_columns(df) -> None:
-    """In-place: strip whitespace + NFKC normalize on all string-like columns.
+    """In-place: strip whitespace on all string-like columns. Vectorized.
 
     Critical for sede column: pyarrow predicate pushdown is byte-exact and a
     single trailing space silently drops entire sedes from filtered results.
     """
-    import unicodedata as _ud
     for col in df.columns:
         try:
             s = df[col]
             if s.dtype == object or str(s.dtype) == "string":
-                df[col] = (
-                    s.astype("string")
-                    .map(lambda x: _ud.normalize("NFKC", x).strip() if isinstance(x, str) else x)
-                )
+                df[col] = s.astype("string").str.strip()
         except Exception:
             continue
 
