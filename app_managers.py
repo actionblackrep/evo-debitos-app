@@ -15,7 +15,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 import tempfile
 from datetime import date, datetime, timedelta
 
@@ -179,9 +183,140 @@ def shared_pull_path() -> str | None:
     return shared_cache.pull_parquet()
 
 
+
+# =========================================================
+# API v2 (manual connect, multi-header, month param)
+# =========================================================
+def _fetch_debitos_v2(url: str, token: str, month: str | None,
+                      page_size: int = 5000, timeout: int = 60) -> pd.DataFrame:
+    """Fetch debitos with `month=YYYY-MM`, trying multiple auth header variants.
+
+    The token is read server-side (st.secrets / env). It NEVER travels through
+    the UI. Returns a DataFrame; raises RuntimeError on failure.
+    """
+    if not month:
+        month = datetime.now().strftime("%Y-%m")
+
+    base_qs = {"month": month}
+    header_variants = [
+        {"Authorization": f"Bearer {token}"},
+        {"Authorization": token},
+        {"x-api-key": token},
+        {"X-API-Token": token},
+        {"api-token": token},
+    ]
+    last_err = "no se intento ninguna llamada"
+    for hv in header_variants:
+        headers = dict(hv)
+        headers["Accept"] = "application/json"
+        headers["User-Agent"] = "evo-debitos-gm/2.0"
+        rows: list = []
+        ok = False
+        page = 1
+        while True:
+            qs = dict(base_qs)
+            qs["page"] = page
+            qs["size"] = page_size
+            full = url + "?" + urllib.parse.urlencode(qs)
+            req = urllib.request.Request(full, headers=headers, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    raw = r.read()
+                    payload = json.loads(raw)
+                    ok = True
+            except urllib.error.HTTPError as e:
+                last_err = f"HTTP {e.code} con header {list(hv)[0]}"
+                ok = False
+                break
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                ok = False
+                break
+
+            if isinstance(payload, list):
+                recs = payload
+            elif isinstance(payload, dict):
+                recs = next(
+                    (payload[k] for k in ("data", "records", "items", "results", "rows")
+                     if isinstance(payload.get(k), list)),
+                    [],
+                )
+            else:
+                recs = []
+
+            if not recs:
+                break
+            rows.extend(recs)
+            if len(recs) < page_size:
+                break
+            page += 1
+            if page > 50:
+                break
+
+        if ok and rows:
+            df = pd.json_normalize(rows)
+            df["__source_file__"] = f"api:{url}?month={month}"
+            return df
+
+    raise RuntimeError(f"No se pudo conectar a la API. Detalle: {last_err}")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_fetch_api(url: str, month: str) -> str:
+    """Fetch via API and persist as parquet on disk. Returns parquet path.
+
+    Token is read internally from gr.DEFAULT_API_KEY; never as a function arg
+    so it does not appear in the cache key visible in error traces.
+    """
+    df = _fetch_debitos_v2(url, gr.DEFAULT_API_KEY, month=month)
+    # Canonicalize string columns (strip + NFKC) before persisting
+    import unicodedata as _ud
+    for c in df.columns:
+        try:
+            s = df[c]
+            if s.dtype == object or str(s.dtype) == "string":
+                df[c] = (
+                    s.astype("string")
+                    .map(lambda x: _ud.normalize("NFKC", x).strip() if isinstance(x, str) else x)
+                )
+        except Exception:
+            continue
+    h = hashlib.md5(f"{url}::{month}".encode()).hexdigest()[:16]
+    pq_path = os.path.join(tempfile.gettempdir(), f"evo_debits_api_{h}.parquet")
+    df.to_parquet(pq_path, index=False, compression="snappy")
+    return pq_path
+
+
+def available_months(n: int = 12) -> list[str]:
+    out = []
+    today = date.today()
+    y, m = today.year, today.month
+    for _ in range(n):
+        out.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return out
+
+
 # =========================================================
 # Pipeline
 # =========================================================
+ID_CLIENT_CANDIDATES = [
+    "id_client", "id_cliente", "client_id", "Cliente_id",
+    "id", "ID", "Id", "user_id", "userId", "userid",
+    "id_usuario", "ID_usuario", "idUsuario",
+]
+
+
+def detect_id_client_column(df) -> str | None:
+    for c in ID_CLIENT_CANDIDATES:
+        if c in df.columns:
+            return c
+    return None
+
+
 def run_pipeline_for_sede(df, sede_label, since, until):
     cols = gr.resolve_columns(df)
     df = gr.coerce(df, cols)
@@ -193,6 +328,17 @@ def run_pipeline_for_sede(df, sede_label, since, until):
         if until:
             df = df[d <= pd.to_datetime(until) + pd.Timedelta(days=1)]
     summary, ap, dn = gr.compute_summary(df, cols)
+
+    # Clientes unicos por id (operaciones vs personas distintas)
+    id_col_local = detect_id_client_column(df)
+    if id_col_local:
+        try:
+            summary["clients_total"] = int(df[id_col_local].dropna().nunique())
+            summary["clients_approved"] = int(df.loc[ap, id_col_local].dropna().nunique())
+            summary["clients_denied"] = int(df.loc[dn, id_col_local].dropna().nunique())
+        except Exception:
+            pass
+
     sedes = gr.by_sede(df, cols, ap, dn)
     motivos = gr.by_motivo(df, cols, dn)
     tipos = gr.by_tipo(df, cols, dn)
@@ -201,28 +347,18 @@ def run_pipeline_for_sede(df, sede_label, since, until):
     return df, cols, summary, sedes, motivos, tipos, marcas, daily
 
 
-def robust_period(df, cols):
-    """Returns (date_min, date_max) ignoring 1% of outliers on each tail."""
-    if "intento" not in cols:
-        return None, None
-    dts = pd.to_datetime(df[cols["intento"]], errors="coerce").dropna()
-    if dts.empty:
-        return None, None
-    if len(dts) >= 50:
-        lo = dts.quantile(0.01)
-        hi = dts.quantile(0.99)
-    else:
-        lo, hi = dts.min(), dts.max()
-    return lo, hi
+def build_pdf_bytes(df, cols, summary, sedes, motivos, tipos, marcas, daily, sede_label,
+                    since=None, until=None):
+    """Genera el PDF.
 
-
-def build_pdf_bytes(df, cols, summary, sedes, motivos, tipos, marcas, daily, sede_label):
-    # Periodo robusto en el header: ignora fechas aisladas fuera del rango real
-    lo, hi = robust_period(df, cols)
-    if lo is not None:
+    El header del PDF muestra EXACTAMENTE el rango since/until elegido por el
+    usuario (no se infiere del dataset). Esto garantiza que el PDF, las cards,
+    la tabla y el Excel siempre reporten el mismo periodo.
+    """
+    if since is not None and until is not None:
         summary = dict(summary)
-        summary["date_min"] = lo
-        summary["date_max"] = hi
+        summary["date_min"] = pd.Timestamp(since)
+        summary["date_max"] = pd.Timestamp(until)
     with tempfile.TemporaryDirectory() as tmp:
         chart_dir = os.path.join(tmp, "charts")
         os.makedirs(chart_dir, exist_ok=True)
@@ -270,25 +406,19 @@ def reset_state():
 # =========================================================
 # Sidebar
 # =========================================================
+# Endpoint config (token NO se expone en la UI; viene de st.secrets / env)
+api_url = gr.DEFAULT_API_URL
+
 with st.sidebar:
     st.title("Configuracion")
-    st.caption("Solo administradores.")
-    api_url = st.text_input("URL del endpoint", value=gr.DEFAULT_API_URL)
-    api_key = st.text_input("API Key", value=gr.DEFAULT_API_KEY, type="password")
-    if st.button("Recargar datos del admin", type="primary", use_container_width=True,
-                 help="Borra todos los caches locales y vuelve a leer la API y el cache compartido."):
-        reset_state()
-        st.cache_data.clear()
-        try:
-            shared_pull_path.clear()
-        except Exception:
-            pass
-        st.rerun()
-    if st.button("Forzar reconexion API", use_container_width=True):
+    st.caption("Token y URL gestionados por el backend.")
+    st.code(api_url, language=None)
+    if st.button("Recargar datos", type="primary", use_container_width=True,
+                 help="Limpia todos los caches locales y reinicia la fuente."):
         reset_state()
         st.cache_data.clear()
         st.rerun()
-    if st.button("Reiniciar todo", use_container_width=True):
+    if st.button("Reiniciar fuente", use_container_width=True):
         reset_state()
         st.rerun()
     st.markdown("---")
@@ -329,66 +459,94 @@ st.caption("La fuente se selecciona automaticamente: API si responde, "
 
 
 # =========================================================
-# Auto-detectar fuente
+# Source picker (manual). NO se llama a la API hasta que el usuario clickee.
 # =========================================================
 if "source" not in st.session_state:
-    api_err = None
-    with st.spinner("Conectando a la API EVO..."):
-        try:
-            sedes_api = api_list_sedes(api_url, api_key)
-            if sedes_api:
-                st.session_state["source"] = "api"
-                st.session_state["sedes_api"] = sedes_api
-                st.rerun()
-        except Exception as e:
-            api_err = str(e)[:300]
-            st.session_state["api_error"] = api_err
+    st.markdown("### 1. Selecciona la fuente de datos")
+    st.caption("La API NO se consulta automaticamente. Elige una opcion para cargar.")
 
-    with st.spinner("Buscando datos publicados por el admin..."):
-        try:
-            pq_path = shared_pull_path()
-            if pq_path:
-                sede_col, sedes_shared = parquet_list_sedes(pq_path)
-                if sedes_shared:
-                    st.session_state["source"] = "shared"
-                    st.session_state["shared_pq_path"] = pq_path
-                    st.session_state["shared_sede_col"] = sede_col
-                    st.session_state["sedes_shared"] = sedes_shared
-                    if api_err:
-                        st.session_state["used_fallback"] = True
-                    st.rerun()
-        except Exception as e:
-            st.session_state["shared_error"] = str(e)[:300]
+    col_api, col_shared, col_file = st.columns(3, gap="medium")
 
-    # Manual upload as last resort
-    st.warning(
-        "No hay datos disponibles automaticamente. "
-        "La API no respondio y el admin aun no ha publicado un archivo."
-    )
-    if st.session_state.get("api_error"):
-        with st.expander("Detalle del error de API"):
-            st.code(st.session_state["api_error"])
-    if not shared_cache.is_configured():
-        st.info(
-            "El cache compartido NO esta configurado. Pide al admin que agregue "
-            "los secrets `GITHUB_TOKEN` y `GITHUB_REPO` en Streamlit Community Cloud."
+    # --- API EVO ---
+    with col_api:
+        st.markdown("#### 🌐 API EVO")
+        st.caption("Datos en vivo. Default: mes actual.")
+        months = available_months(12)
+        api_month = st.selectbox(
+            "Mes a consultar",
+            months,
+            index=0,
+            key="api_month_pick",
+            help="Periodo que se pedira al endpoint. La data se filtra luego por sede.",
         )
-    st.markdown("#### Subir un Excel manualmente")
-    uploaded = st.file_uploader("Archivo .xlsx", type=["xlsx", "xlsm"],
-                                key="upl_fallback",
-                                label_visibility="collapsed")
-    if uploaded is not None:
-        with st.spinner("Indexando archivo..."):
-            pq_path = excel_bytes_to_parquet(uploaded.getvalue(), uploaded.name)
-            sede_col, sedes_local = parquet_list_sedes(pq_path)
-        if sedes_local:
-            st.session_state["source"] = "file"
-            st.session_state["shared_pq_path"] = pq_path
-            st.session_state["shared_sede_col"] = sede_col
-            st.session_state["sedes_shared"] = sedes_local
-            st.rerun()
+        if st.button("Conectar", type="primary", use_container_width=True, key="btn_connect_api"):
+            with st.spinner(f"Consultando API ({api_month})..."):
+                try:
+                    pq_path_api = cached_fetch_api(api_url, api_month)
+                    sede_col, sedes_list = parquet_list_sedes(pq_path_api)
+                    if not sedes_list:
+                        st.error("La API respondio pero sin columna de sede. Revisa el endpoint.")
+                    else:
+                        st.session_state["source"] = "api"
+                        st.session_state["api_month"] = api_month
+                        st.session_state["shared_pq_path"] = pq_path_api
+                        st.session_state["shared_sede_col"] = sede_col
+                        st.session_state["sedes_shared"] = sedes_list
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo cargar la API: {e}")
+
+    # --- Datos del admin ---
+    with col_shared:
+        st.markdown("#### 🛰  Datos del admin")
+        meta = shared_cache.remote_meta() if shared_cache.is_configured() else None
+        if meta:
+            st.caption(f"Ultima publicacion: `{meta['date'][:16]}Z` ({meta['sha']})")
+        elif shared_cache.is_configured():
+            st.caption("Cache configurado pero el admin no ha publicado aun.")
         else:
-            st.error("No se detecto columna de sede en el archivo.")
+            st.caption("Cache NO configurado. Pide secrets `GITHUB_TOKEN` y `GITHUB_REPO`.")
+        if st.button("Usar datos del admin", use_container_width=True,
+                     key="btn_connect_shared",
+                     disabled=not shared_cache.is_configured()):
+            with st.spinner("Descargando dataset del admin..."):
+                try:
+                    pq_path_sh = shared_pull_path()
+                    if not pq_path_sh:
+                        st.error("No hay datos publicados todavia.")
+                    else:
+                        sede_col, sedes_list = parquet_list_sedes(pq_path_sh)
+                        if not sedes_list:
+                            st.error("El parquet del admin no tiene columna de sede.")
+                        else:
+                            st.session_state["source"] = "shared"
+                            st.session_state["shared_pq_path"] = pq_path_sh
+                            st.session_state["shared_sede_col"] = sede_col
+                            st.session_state["sedes_shared"] = sedes_list
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    # --- Excel manual ---
+    with col_file:
+        st.markdown("#### 📄 Excel local")
+        st.caption("Sube un .xlsx/.xlsm con hoja `data`.")
+        uploaded = st.file_uploader(
+            "Archivo .xlsx", type=["xlsx", "xlsm"],
+            key="upl_picker", label_visibility="collapsed",
+        )
+        if uploaded is not None:
+            with st.spinner("Indexando archivo..."):
+                pq_path_loc = excel_bytes_to_parquet(uploaded.getvalue(), uploaded.name)
+                sede_col, sedes_list = parquet_list_sedes(pq_path_loc)
+            if sedes_list:
+                st.session_state["source"] = "file"
+                st.session_state["shared_pq_path"] = pq_path_loc
+                st.session_state["shared_sede_col"] = sede_col
+                st.session_state["sedes_shared"] = sedes_list
+                st.rerun()
+            else:
+                st.error("No se detecto columna de sede en el archivo.")
     st.stop()
 
 
@@ -397,27 +555,22 @@ if "source" not in st.session_state:
 # =========================================================
 source = st.session_state["source"]
 if source == "api":
-    st.success("Fuente: **API EVO** (datos en vivo).")
+    month_label = st.session_state.get("api_month", "")
+    st.success(f"Fuente: **API EVO** (mes {month_label}).")
 elif source == "shared":
     meta = shared_cache.remote_meta()
-    if st.session_state.get("used_fallback"):
-        msg = "API no disponible. Usando **datos publicados por el admin**."
-    else:
-        msg = "Usando **datos publicados por el admin**."
+    msg = "Fuente: **Datos publicados por el admin**."
     if meta:
         msg += f"  ·  Ultima publicacion: `{meta['date'][:16]}Z` ({meta['sha']})"
     st.info(msg)
 elif source == "file":
-    st.info("Fuente: **Excel local** (subido manualmente, no compartido).")
+    st.info("Fuente: **Excel local** (manual).")
 
 
 # =========================================================
 # Step - sede picker
 # =========================================================
-if source == "api":
-    sedes_options = st.session_state.get("sedes_api", [])
-else:
-    sedes_options = st.session_state.get("sedes_shared", [])
+sedes_options = st.session_state.get("sedes_shared", [])
 
 if not sedes_options:
     st.error("No se obtuvieron sedes desde la fuente activa.")
@@ -447,12 +600,9 @@ if sede_sel == "-- Selecciona una sede --":
 # Carga filtrada
 # =========================================================
 with st.spinner(f"Cargando registros de '{sede_sel}'..."):
-    if source == "api":
-        df = api_load_for_sede(api_url, api_key, sede_sel)
-    else:
-        pq_path = st.session_state["shared_pq_path"]
-        sede_col = st.session_state["shared_sede_col"]
-        df = parquet_filter_by_sede(pq_path, sede_col, sede_sel)
+    pq_path = st.session_state["shared_pq_path"]
+    sede_col = st.session_state["shared_sede_col"]
+    df = parquet_filter_by_sede(pq_path, sede_col, sede_sel)
 
 if df is None or df.empty:
     st.warning(f"No hay registros para la sede '{sede_sel}'.")
@@ -518,15 +668,38 @@ if df_f.empty or summary.get("total", 0) == 0:
 # KPIs
 # =========================================================
 st.markdown("### Resultados")
+
+def _clients_sub(value_key: str) -> str:
+    n = summary.get(value_key)
+    if n is None:
+        return ""
+    return f"{gr.fmt_int(n)} clientes unicos"
+
 k1, k2, k3, k4 = st.columns(4)
 with k1:
-    metric_card("Intentos", gr.fmt_int(summary["total"]), sub=sede_sel)
+    metric_card(
+        "Intentos",
+        f"{gr.fmt_int(summary['total'])}",
+        sub=_clients_sub("clients_total") or sede_sel,
+    )
 with k2:
-    metric_card("Aprobados", gr.fmt_int(summary["approved"]),
-                sub=gr.fmt_pct(summary["success_rate"]), kind="good")
+    sub_a = gr.fmt_pct(summary["success_rate"])
+    cs = _clients_sub("clients_approved")
+    metric_card(
+        "Aprobados",
+        f"{gr.fmt_int(summary['approved'])}",
+        sub=(f"{cs}  ·  {sub_a}" if cs else sub_a),
+        kind="good",
+    )
 with k3:
-    metric_card("Negados", gr.fmt_int(summary["denied"]),
-                sub=gr.fmt_pct(summary["fail_rate"]), kind="bad")
+    sub_d = gr.fmt_pct(summary["fail_rate"])
+    cs = _clients_sub("clients_denied")
+    metric_card(
+        "Negados",
+        f"{gr.fmt_int(summary['denied'])}",
+        sub=(f"{cs}  ·  {sub_d}" if cs else sub_d),
+        kind="bad",
+    )
 with k4:
     if "amount_approved" in summary:
         metric_card("Recuperado", gr.fmt_money(summary["amount_approved"]),
@@ -609,7 +782,8 @@ with col_a:
     if st.button("Generar PDF", type="primary", use_container_width=True):
         with st.spinner("Generando PDF..."):
             pdf_bytes = build_pdf_bytes(df_f, cols, summary, sedes, motivos,
-                                        tipos, marcas, daily, sede_sel)
+                                        tipos, marcas, daily, sede_sel,
+                                        since=since, until=until)
             tag = "_" + gr.normalize_match(sede_sel).upper().replace(" ", "_")[:30]
             fname = f"Reporte_Debitos{tag}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
             st.download_button("Descargar PDF", data=pdf_bytes, file_name=fname,
