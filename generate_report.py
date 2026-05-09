@@ -362,9 +362,27 @@ def compute_summary(df, cols):
     id_col_local = next((c for c in ID_CLIENT_CANDIDATES if c in df.columns), None)
     if id_col_local:
         try:
-            res["clients_total"] = int(df[id_col_local].dropna().nunique())
-            res["clients_approved"] = int(df.loc[approved_mask, id_col_local].dropna().nunique())
-            res["clients_denied"] = int(df.loc[denied_mask, id_col_local].dropna().nunique())
+            # Mutually exclusive partition por usuario:
+            #   clients_denied   = usuarios con AL MENOS 1 intento negado
+            #   clients_approved = usuarios con 0 intentos negados (sin fallos)
+            # Garantiza clients_approved + clients_denied == clients_total
+            # (un usuario que mezcla aprobados y negados va a "denied").
+            all_users = set(df[id_col_local].dropna().astype(str).unique())
+            users_denied = set(
+                df.loc[denied_mask, id_col_local].dropna().astype(str).unique()
+            )
+            users_approved_ever = set(
+                df.loc[approved_mask, id_col_local].dropna().astype(str).unique()
+            )
+            res["clients_total"] = len(all_users)
+            res["clients_denied"] = len(users_denied)
+            res["clients_approved"] = len(all_users - users_denied)
+            # Ever-approved vs never-approved (independiente de los buckets
+            # mutuamente exclusivos clients_approved/clients_denied).
+            # users_never_approved incluye tambien usuarios cuyos intentos
+            # fueron Pendiente/Error sin ningun Aprobado.
+            res["users_ever_approved"] = len(users_approved_ever)
+            res["users_never_approved"] = len(all_users - users_approved_ever)
         except Exception:
             pass
     if "valor" in cols:
@@ -964,6 +982,12 @@ def build_insights(summary, sedes, motivos, tipos):
     out.append(f"Se procesaron <b>{fmt_int(summary['total'])}</b> intentos de debito; "
                f"<b>{fmt_int(summary['approved'])}</b> exitosos ({rate:.1f}%) y "
                f"<b>{fmt_int(summary['denied'])}</b> negados ({summary['fail_rate']*100:.1f}%).")
+    if "users_never_approved" in summary and summary.get("clients_total"):
+        nv = summary["users_never_approved"]
+        tot = summary["clients_total"]
+        pct = (nv / tot) * 100 if tot else 0
+        out.append(f"<b>{fmt_int(nv)}</b> usuarios distintos ({pct:.1f}%) "
+                   f"nunca tuvieron un debito aprobado en el periodo.")
     if "amount_total" in summary:
         recovered = summary.get("amount_approved", 0)
         lost = summary.get("amount_denied", 0)

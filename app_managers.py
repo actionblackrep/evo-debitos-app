@@ -370,16 +370,9 @@ def run_pipeline_for_sede(df, sede_label, since, until):
         if until:
             df = df[d <= pd.to_datetime(until) + pd.Timedelta(days=1)]
     summary, ap, dn = gr.compute_summary(df, cols)
-
-    # Clientes unicos por id (operaciones vs personas distintas)
-    id_col_local = detect_id_client_column(df)
-    if id_col_local:
-        try:
-            summary["clients_total"] = int(df[id_col_local].dropna().nunique())
-            summary["clients_approved"] = int(df.loc[ap, id_col_local].dropna().nunique())
-            summary["clients_denied"] = int(df.loc[dn, id_col_local].dropna().nunique())
-        except Exception:
-            pass
+    # Nota: compute_summary ya computa clients_total/approved/denied de forma
+    # mutuamente exclusiva (clients_approved = sin fallos; clients_denied = con
+    # >= 1 fallo). NO redefinir aqui.
 
     sedes = gr.by_sede(df, cols, ap, dn)
     motivos = gr.by_motivo(df, cols, dn)
@@ -747,6 +740,23 @@ with k4:
                     sub=f"En riesgo: {gr.fmt_money(summary.get('amount_denied', 0))}",
                     kind="gold")
 
+
+# ---------- Usuarios nunca aprobados (nuevo, additivo) ----------
+if summary.get("users_never_approved") is not None and summary.get("clients_total"):
+    nv = summary["users_never_approved"]
+    ev = summary["users_ever_approved"]
+    tot = summary["clients_total"]
+    nv_pct = (nv / tot) * 100 if tot else 0
+    ev_pct = (ev / tot) * 100 if tot else 0
+    st.markdown(
+        f"""<div style='background:#FFF8E1; border-left:4px solid #E67E22;
+        padding:10px 14px; border-radius:6px; margin-top:10px; margin-bottom:6px;'>
+        <b>Usuarios nunca aprobados:</b> {gr.fmt_int(nv)} de {gr.fmt_int(tot)}
+        ({nv_pct:.1f}%) &middot;
+        <span style='color:#7A8597;'>Alguna vez aprobados: {gr.fmt_int(ev)} ({ev_pct:.1f}%)</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
 # =========================================================
 # Donut + tendencia
