@@ -293,16 +293,43 @@ with st.spinner("Calculando metricas..."):
 
 # ---------- KPIs ----------
 st.markdown("### Resultados")
+
+def _has_clients() -> bool:
+    return summary.get("clients_total") is not None
+
 k1, k2, k3, k4 = st.columns(4)
 with k1:
-    metric_card("Intentos", gr.fmt_int(summary["total"]),
-                sub=f"{df_f[cols['sede']].nunique() if 'sede' in cols else 0} sedes" if not sede_arg else sede_label)
+    if _has_clients():
+        metric_card(
+            "Intentos",
+            gr.fmt_int(summary["clients_total"]),
+            sub=f"usuarios unicos<br>{gr.fmt_int(summary['total'])} operaciones",
+        )
+    else:
+        metric_card("Intentos", gr.fmt_int(summary["total"]),
+                    sub=f"{df_f[cols['sede']].nunique() if 'sede' in cols else 0} sedes" if not sede_arg else sede_label)
 with k2:
-    metric_card("Aprobados", gr.fmt_int(summary["approved"]),
-                sub=gr.fmt_pct(summary["success_rate"]), kind="good")
+    if _has_clients():
+        metric_card(
+            "Aprobados",
+            gr.fmt_int(summary["clients_approved"]),
+            sub=f"usuarios unicos<br>{gr.fmt_int(summary['approved'])} operaciones &middot; {gr.fmt_pct(summary['success_rate'])}",
+            kind="good",
+        )
+    else:
+        metric_card("Aprobados", gr.fmt_int(summary["approved"]),
+                    sub=gr.fmt_pct(summary["success_rate"]), kind="good")
 with k3:
-    metric_card("Negados", gr.fmt_int(summary["denied"]),
-                sub=gr.fmt_pct(summary["fail_rate"]), kind="bad")
+    if _has_clients():
+        metric_card(
+            "Negados",
+            gr.fmt_int(summary["clients_denied"]),
+            sub=f"usuarios unicos<br>{gr.fmt_int(summary['denied'])} operaciones &middot; {gr.fmt_pct(summary['fail_rate'])}",
+            kind="bad",
+        )
+    else:
+        metric_card("Negados", gr.fmt_int(summary["denied"]),
+                    sub=gr.fmt_pct(summary["fail_rate"]), kind="bad")
 with k4:
     if "amount_approved" in summary:
         metric_card("Recuperado", gr.fmt_money(summary["amount_approved"]),
@@ -343,7 +370,7 @@ with right:
         st.info("No hay suficientes dias para mostrar tendencia.")
 
 # ---------- Motivos con explicacion ----------
-st.markdown("### 🔎 Motivos de rechazo (en espanol, con accion sugerida)")
+st.markdown("### 🔎 Motivos de rechazo")
 if not motivos.empty:
     table = motivos.head(15)[["Ranking", "MotivoES", "Veces", "Pct", "Responsable", "Accion"]].copy()
     table.columns = ["#", "Motivo (ES)", "Veces", "% del total negado", "Responsable", "Accion sugerida"]

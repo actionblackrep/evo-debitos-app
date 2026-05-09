@@ -353,6 +353,20 @@ def compute_summary(df, cols):
         "success_rate": rate,
         "fail_rate": fail_rate,
     }
+    # Unique clients per metric (additive; no impact on existing calculations)
+    ID_CLIENT_CANDIDATES = [
+        "id_client", "id_cliente", "client_id", "Cliente_id",
+        "id", "ID", "Id", "user_id", "userId", "userid",
+        "id_usuario", "ID_usuario", "idUsuario",
+    ]
+    id_col_local = next((c for c in ID_CLIENT_CANDIDATES if c in df.columns), None)
+    if id_col_local:
+        try:
+            res["clients_total"] = int(df[id_col_local].dropna().nunique())
+            res["clients_approved"] = int(df.loc[approved_mask, id_col_local].dropna().nunique())
+            res["clients_denied"] = int(df.loc[denied_mask, id_col_local].dropna().nunique())
+        except Exception:
+            pass
     if "valor" in cols:
         res["amount_total"] = float(pd.to_numeric(df[cols["valor"]], errors="coerce").fillna(0).sum())
         res["amount_approved"] = float(pd.to_numeric(df.loc[approved_mask, cols["valor"]], errors="coerce").fillna(0).sum())

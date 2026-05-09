@@ -66,6 +66,35 @@ hr {margin: 0.8rem 0;}
 """, unsafe_allow_html=True)
 
 
+# =========================================================
+# Bogota timezone helpers (UTC-5, sin DST)
+# =========================================================
+from datetime import timezone as _tz
+
+BOGOTA_TZ = _tz(timedelta(hours=-5))
+ES_MONTHS = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul",
+             "Ago", "Sep", "Oct", "Nov", "Dic"]
+
+
+def format_publish_date_bogota(iso_str: str | None) -> str:
+    """Convert UTC ISO8601 to '09 May 2026 - 11:47 PM Bogota'."""
+    if not iso_str:
+        return ""
+    try:
+        s = iso_str.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        bg = dt.astimezone(BOGOTA_TZ)
+        h12 = bg.hour % 12 or 12
+        ampm = "PM" if bg.hour >= 12 else "AM"
+        return f"{bg.day:02d} {ES_MONTHS[bg.month-1]} {bg.year} - {h12}:{bg.minute:02d} {ampm} Bogota"
+    except Exception:
+        return iso_str
+
+
 SEDE_COL_CANDIDATES = ["Sede/club", "Sede", "Club", "sede", "club", "sede_club", "branch"]
 
 
@@ -452,7 +481,7 @@ with st.sidebar:
         st.caption(f"Repo: `{cfg['repo']}` · Rama: `{cfg['branch']}`")
         meta = shared_cache.remote_meta()
         if meta:
-            st.success(f"Ultima publicacion: {meta['date'][:16]}Z")
+            st.success(f"Ultima publicacion:\n{format_publish_date_bogota(meta['date'])}")
             st.caption(f"Commit: `{meta['sha']}`")
         else:
             st.warning("Configurado pero sin datos publicados todavia. "
@@ -478,48 +507,21 @@ if "source" not in st.session_state:
     st.markdown("### 1. Selecciona la fuente de datos")
     st.caption("La API NO se consulta automaticamente. Elige una opcion para cargar.")
 
-    col_api, col_shared, col_file = st.columns(3, gap="medium")
+    col_shared, col_api = st.columns(2, gap="large")
 
-    # --- API EVO ---
-    with col_api:
-        st.markdown("#### 🌐 API EVO")
-        st.caption("Datos en vivo. Default: mes actual.")
-        months = available_months(12)
-        api_month = st.selectbox(
-            "Mes a consultar",
-            months,
-            index=0,
-            key="api_month_pick",
-            help="Periodo que se pedira al endpoint. La data se filtra luego por sede.",
-        )
-        if st.button("Conectar", type="primary", use_container_width=True, key="btn_connect_api"):
-            with st.spinner(f"Consultando API ({api_month})..."):
-                try:
-                    pq_path_api = cached_fetch_api(api_url, api_month)
-                    sede_col, sedes_list = parquet_list_sedes(pq_path_api)
-                    if not sedes_list:
-                        st.error("La API respondio pero sin columna de sede. Revisa el endpoint.")
-                    else:
-                        st.session_state["source"] = "api"
-                        st.session_state["api_month"] = api_month
-                        st.session_state["shared_pq_path"] = pq_path_api
-                        st.session_state["shared_sede_col"] = sede_col
-                        st.session_state["sedes_shared"] = sedes_list
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"No se pudo cargar la API: {e}")
-
-    # --- Datos del admin ---
+    # --- Datos del admin (primero, mas comun) ---
     with col_shared:
         st.markdown("#### 🛰  Datos del admin")
         meta = shared_cache.remote_meta() if shared_cache.is_configured() else None
         if meta:
-            st.caption(f"Ultima publicacion: `{meta['date'][:16]}Z` ({meta['sha']})")
+            pretty = format_publish_date_bogota(meta["date"])
+            st.markdown(f"**Última publicación:**  \n{pretty}")
+            st.caption(f"Commit: `{meta['sha']}`")
         elif shared_cache.is_configured():
             st.caption("Cache configurado pero el admin no ha publicado aun.")
         else:
             st.caption("Cache NO configurado. Pide secrets `GITHUB_TOKEN` y `GITHUB_REPO`.")
-        if st.button("Usar datos del admin", use_container_width=True,
+        if st.button("Usar datos del admin", type="primary", use_container_width=True,
                      key="btn_connect_shared",
                      disabled=not shared_cache.is_configured()):
             with st.spinner("Descargando dataset del admin..."):
@@ -540,26 +542,34 @@ if "source" not in st.session_state:
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-    # --- Excel manual ---
-    with col_file:
-        st.markdown("#### 📄 Excel local")
-        st.caption("Sube un .xlsx/.xlsm con hoja `data`.")
-        uploaded = st.file_uploader(
-            "Archivo .xlsx", type=["xlsx", "xlsm"],
-            key="upl_picker", label_visibility="collapsed",
+    # --- API EVO ---
+    with col_api:
+        st.markdown("#### 🌐 API EVO")
+        st.caption("Datos en vivo. Default: mes actual.")
+        months = available_months(12)
+        api_month = st.selectbox(
+            "Mes a consultar",
+            months,
+            index=0,
+            key="api_month_pick",
+            help="Periodo que se pedira al endpoint. La data se filtra luego por sede.",
         )
-        if uploaded is not None:
-            with st.spinner("Indexando archivo..."):
-                pq_path_loc = excel_bytes_to_parquet(uploaded.getvalue(), uploaded.name)
-                sede_col, sedes_list = parquet_list_sedes(pq_path_loc)
-            if sedes_list:
-                st.session_state["source"] = "file"
-                st.session_state["shared_pq_path"] = pq_path_loc
-                st.session_state["shared_sede_col"] = sede_col
-                st.session_state["sedes_shared"] = sedes_list
-                st.rerun()
-            else:
-                st.error("No se detecto columna de sede en el archivo.")
+        if st.button("Conectar", use_container_width=True, key="btn_connect_api"):
+            with st.spinner(f"Consultando API ({api_month})..."):
+                try:
+                    pq_path_api = cached_fetch_api(api_url, api_month)
+                    sede_col, sedes_list = parquet_list_sedes(pq_path_api)
+                    if not sedes_list:
+                        st.error("La API respondio pero sin columna de sede. Revisa el endpoint.")
+                    else:
+                        st.session_state["source"] = "api"
+                        st.session_state["api_month"] = api_month
+                        st.session_state["shared_pq_path"] = pq_path_api
+                        st.session_state["shared_sede_col"] = sede_col
+                        st.session_state["sedes_shared"] = sedes_list
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo cargar la API: {e}")
     st.stop()
 
 
@@ -574,7 +584,7 @@ elif source == "shared":
     meta = shared_cache.remote_meta()
     msg = "Fuente: **Datos publicados por el admin**."
     if meta:
-        msg += f"  ·  Ultima publicacion: `{meta['date'][:16]}Z` ({meta['sha']})"
+        msg += f"  ·  Última publicación: {format_publish_date_bogota(meta['date'])} (`{meta['sha']}`)"
     st.info(msg)
 elif source == "file":
     st.info("Fuente: **Excel local** (manual).")
@@ -659,7 +669,7 @@ range_msg = f"Rango disponible en los datos: **{fmin}** a **{fmax}**"
 if source == "shared":
     meta = shared_cache.remote_meta()
     if meta:
-        range_msg += f"  ·  Publicado por admin: `{meta['date'][:16]}Z`"
+        range_msg += f"  ·  Publicado por admin: {format_publish_date_bogota(meta['date'])}"
 elif source == "api":
     range_msg += "  ·  Origen: API EVO en vivo"
 elif source == "file":
@@ -688,37 +698,41 @@ if df_f.empty or summary.get("total", 0) == 0:
 # =========================================================
 st.markdown("### Resultados")
 
-def _clients_sub(value_key: str) -> str:
-    n = summary.get(value_key)
-    if n is None:
-        return ""
-    return f"{gr.fmt_int(n)} clientes unicos"
+def _has_clients() -> bool:
+    return summary.get("clients_total") is not None
 
 k1, k2, k3, k4 = st.columns(4)
 with k1:
-    metric_card(
-        "Intentos",
-        f"{gr.fmt_int(summary['total'])}",
-        sub=_clients_sub("clients_total") or sede_sel,
-    )
+    if _has_clients():
+        metric_card(
+            "Intentos",
+            gr.fmt_int(summary["clients_total"]),
+            sub=f"usuarios unicos<br>{gr.fmt_int(summary['total'])} operaciones",
+        )
+    else:
+        metric_card("Intentos", gr.fmt_int(summary["total"]), sub=sede_sel)
 with k2:
-    sub_a = gr.fmt_pct(summary["success_rate"])
-    cs = _clients_sub("clients_approved")
-    metric_card(
-        "Aprobados",
-        f"{gr.fmt_int(summary['approved'])}",
-        sub=(f"{cs}  ·  {sub_a}" if cs else sub_a),
-        kind="good",
-    )
+    if _has_clients():
+        metric_card(
+            "Aprobados",
+            gr.fmt_int(summary["clients_approved"]),
+            sub=f"usuarios unicos<br>{gr.fmt_int(summary['approved'])} operaciones &middot; {gr.fmt_pct(summary['success_rate'])}",
+            kind="good",
+        )
+    else:
+        metric_card("Aprobados", gr.fmt_int(summary["approved"]),
+                    sub=gr.fmt_pct(summary["success_rate"]), kind="good")
 with k3:
-    sub_d = gr.fmt_pct(summary["fail_rate"])
-    cs = _clients_sub("clients_denied")
-    metric_card(
-        "Negados",
-        f"{gr.fmt_int(summary['denied'])}",
-        sub=(f"{cs}  ·  {sub_d}" if cs else sub_d),
-        kind="bad",
-    )
+    if _has_clients():
+        metric_card(
+            "Negados",
+            gr.fmt_int(summary["clients_denied"]),
+            sub=f"usuarios unicos<br>{gr.fmt_int(summary['denied'])} operaciones &middot; {gr.fmt_pct(summary['fail_rate'])}",
+            kind="bad",
+        )
+    else:
+        metric_card("Negados", gr.fmt_int(summary["denied"]),
+                    sub=gr.fmt_pct(summary["fail_rate"]), kind="bad")
 with k4:
     if "amount_approved" in summary:
         metric_card("Recuperado", gr.fmt_money(summary["amount_approved"]),
@@ -778,7 +792,7 @@ with right:
 # =========================================================
 # Motivos
 # =========================================================
-st.markdown("### Motivos de rechazo (en espanol, con accion sugerida)")
+st.markdown("### Motivos de rechazo")
 if not motivos.empty:
     table = motivos.head(15)[
         ["Ranking", "MotivoES", "Veces", "Pct", "Responsable", "Accion"]
@@ -901,5 +915,11 @@ with col_b:
         use_container_width=True,
     )
 
+st.markdown(
+    "<div style='font-size:12px; color:#7A8597; margin-top:6px;'>"
+    "ⓘ El Excel puede contener usuarios duplicados porque tuvieron mas de un motivo de rechazo."
+    "</div>",
+    unsafe_allow_html=True,
+)
 st.caption(f"Sede: {sede_sel}  ·  Periodo: {since} a {until}  ·  "
            f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
