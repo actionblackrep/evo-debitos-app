@@ -52,9 +52,18 @@ hr {margin: 0.8rem 0;}
 
 
 # ---------- Helpers ----------
-@st.cache_data(ttl=300, show_spinner=False)
-def load_from_api(api_url, api_key):
-    df = gr.fetch_from_api(api_url, api_key)
+@st.cache_data(ttl=600, show_spinner=False)
+def load_from_api(api_url, month):
+    """Fetch via v2 endpoint with month + multi-header. Token from env."""
+    df = gr.fetch_from_api_v2(api_url, gr.DEFAULT_API_KEY, month=month)
+    # Vectorized strip on string columns (avoid pyarrow byte-mismatch downstream)
+    for c in df.columns:
+        try:
+            s = df[c]
+            if s.dtype == object or str(s.dtype) == "string":
+                df[c] = s.astype("string").str.strip()
+        except Exception:
+            continue
     return df
 
 
@@ -150,15 +159,13 @@ def build_pdf_bytes(df, cols, summary, sedes, motivos, tipos, marcas, daily, sed
 # ---------- Sidebar (configuracion avanzada) ----------
 with st.sidebar:
     st.title("⚙ Configuracion avanzada")
-    st.caption("Solo para administradores. El usuario final no necesita tocar esto.")
+    st.caption("Solo administradores. Token gestionado por el backend (env / st.secrets).")
     api_url = st.text_input("URL del endpoint",
                             value=gr.DEFAULT_API_URL,
                             help="Endpoint que devuelve la data de debitos en JSON.")
-    api_key = st.text_input("API Key",
-                            value=gr.DEFAULT_API_KEY,
-                            type="password")
     if st.button("Limpiar fuente y empezar de nuevo", use_container_width=True):
-        for k in ("data_df", "data_source", "data_label", "data_err"):
+        for k in ("data_df", "data_source", "data_label", "data_err",
+                  "publish_msg", "publish_ok"):
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -180,16 +187,26 @@ if df is None:
     with col_api:
         st.markdown("#### 🌐 Cargar desde la API EVO")
         st.caption(f"Endpoint configurado: `{api_url}`")
-        if st.button("Cargar desde API", type="primary", use_container_width=True, key="btn_api"):
-            with st.spinner("Consultando la API..."):
+        months = gr.available_months(12)
+        api_month = st.selectbox(
+            "Mes a consultar",
+            months,
+            index=0,
+            key="admin_api_month",
+            help="Periodo que se pedira al endpoint (`?month=YYYY-MM`).",
+        )
+        if st.button("Conectar", type="primary", use_container_width=True, key="btn_api"):
+            with st.spinner(f"Consultando API ({api_month})..."):
                 try:
-                    df_loaded = load_from_api(api_url, api_key)
+                    df_loaded = load_from_api(api_url, api_month)
                     st.session_state["data_df"] = df_loaded
                     st.session_state["data_source"] = "api"
-                    st.session_state["data_label"] = f"API ({len(df_loaded):,} registros)"
+                    st.session_state["data_label"] = f"API mes {api_month} ({len(df_loaded):,} registros)"
                     st.session_state.pop("data_err", None)
                     try:
-                        ok, msg = shared_cache.publish_dataframe(df_loaded.copy(), source_label="API")
+                        ok, msg = shared_cache.publish_dataframe(
+                            df_loaded.copy(), source_label=f"API mes {api_month}"
+                        )
                         st.session_state["publish_msg"] = msg
                         st.session_state["publish_ok"] = ok
                     except Exception as _e:
