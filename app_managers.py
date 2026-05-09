@@ -323,11 +323,21 @@ def detect_id_client_column(df) -> str | None:
 def run_pipeline_for_sede(df, sede_label, since, until):
     cols = gr.resolve_columns(df)
     df = gr.coerce(df, cols)
+    def _to_naive(s):
+        # Handle tz-aware ISO8601 strings from the new API
+        try:
+            x = pd.to_datetime(s, errors="coerce", utc=True)
+            if getattr(x.dt, "tz", None) is not None:
+                x = x.dt.tz_convert("UTC").dt.tz_localize(None)
+            return x
+        except Exception:
+            return pd.to_datetime(s, errors="coerce")
+
     if "intento" in cols and (since or until):
-        d = pd.to_datetime(df[cols["intento"]], errors="coerce")
+        d = _to_naive(df[cols["intento"]])
         if since:
             df = df[d >= pd.to_datetime(since)]
-            d = pd.to_datetime(df[cols["intento"]], errors="coerce")
+            d = _to_naive(df[cols["intento"]])
         if until:
             df = df[d <= pd.to_datetime(until) + pd.Timedelta(days=1)]
     summary, ap, dn = gr.compute_summary(df, cols)
@@ -628,7 +638,13 @@ st.markdown(
 cols = gr.resolve_columns(df)
 date_col = cols.get("intento")
 if date_col:
-    dts = pd.to_datetime(df[date_col], errors="coerce").dropna()
+    try:
+        dts = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+        if getattr(dts.dt, "tz", None) is not None:
+            dts = dts.dt.tz_convert("UTC").dt.tz_localize(None)
+        dts = dts.dropna()
+    except Exception:
+        dts = pd.to_datetime(df[date_col], errors="coerce").dropna()
     if len(dts):
         fmin = dts.min().date()
         fmax = dts.max().date()

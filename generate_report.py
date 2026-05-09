@@ -125,6 +125,100 @@ def load_data(xlsx_files):
     return full
 
 
+def fetch_from_api_v2(url, token, month=None, page_size=10000, timeout=60):
+    """Fetch debitos with `month=YYYY-MM` and multi-header authentication.
+
+    Used by both apps (app.py admin and app_managers.py GM) for consistency.
+    Tries 5 header variants in order until one returns 2xx. Hard-caps at
+    300k records to protect Streamlit free-tier RAM.
+    """
+    MAX_RECORDS = 300_000
+    if not month:
+        month = datetime.now().strftime("%Y-%m")
+
+    base_qs = {"month": month}
+    header_variants = [
+        {"Authorization": f"Bearer {token}"},
+        {"Authorization": token},
+        {"x-api-key": token},
+        {"X-API-Token": token},
+        {"api-token": token},
+    ]
+    last_err = "no se intento ninguna llamada"
+    for hv in header_variants:
+        headers = dict(hv)
+        headers["Accept"] = "application/json"
+        headers["User-Agent"] = "evo-debitos/2.1"
+        rows = []
+        ok = False
+        page = 1
+        max_pages = (MAX_RECORDS // page_size) + 1
+        while True:
+            qs = dict(base_qs)
+            qs["page"] = page
+            qs["size"] = page_size
+            full = url + "?" + urllib.parse.urlencode(qs)
+            req = urllib.request.Request(full, headers=headers, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    raw = r.read()
+                    payload = json.loads(raw)
+                    ok = True
+            except urllib.error.HTTPError as e:
+                last_err = f"HTTP {e.code} con header {list(hv)[0]}"
+                ok = False
+                break
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                ok = False
+                break
+
+            if isinstance(payload, list):
+                recs = payload
+            elif isinstance(payload, dict):
+                recs = next(
+                    (payload[k] for k in ("data", "records", "items", "results", "rows")
+                     if isinstance(payload.get(k), list)),
+                    [],
+                )
+            else:
+                recs = []
+
+            if not recs:
+                break
+            rows.extend(recs)
+            if len(rows) >= MAX_RECORDS:
+                break
+            if len(recs) < page_size:
+                break
+            page += 1
+            if page > max_pages:
+                break
+
+        if ok and rows:
+            try:
+                df = pd.DataFrame(rows)
+            except Exception:
+                df = pd.json_normalize(rows)
+            df["__source_file__"] = f"api:{url}?month={month}"
+            return df
+
+    raise RuntimeError(f"No se pudo conectar a la API. Detalle: {last_err}")
+
+
+def available_months(n=12):
+    out = []
+    today = datetime.now().date()
+    y, m = today.year, today.month
+    for _ in range(n):
+        out.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return out
+
+
 def fetch_from_api(url, api_key, sede=None, since=None, until=None, page_size=5000, timeout=60):
     """Fetch debits from the configured API.
 
@@ -223,7 +317,16 @@ def resolve_columns(df):
 def coerce(df, cols):
     df = df.copy()
     if "intento" in cols:
-        df[cols["intento"]] = pd.to_datetime(df[cols["intento"]], errors="coerce")
+        # Parse with utc=True to handle mixed tz-aware/naive ISO8601 strings
+        # (the new endpoint returns dates like "2026-04-15T10:30:00Z").
+        # Then drop the tz so downstream comparisons against naive timestamps work.
+        try:
+            s = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True)
+            if getattr(s.dt, "tz", None) is not None:
+                s = s.dt.tz_convert("UTC").dt.tz_localize(None)
+        except Exception:
+            s = pd.to_datetime(df[cols["intento"]], errors="coerce")
+        df[cols["intento"]] = s
     for k in ("status", "motivo", "tipo", "sede", "marca"):
         if k in cols:
             df[cols[k]] = df[cols[k]].apply(normalize_text)
