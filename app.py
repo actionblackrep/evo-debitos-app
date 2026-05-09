@@ -310,10 +310,14 @@ with k1:
                     sub=f"{df_f[cols['sede']].nunique() if 'sede' in cols else 0} sedes" if not sede_arg else sede_label)
 with k2:
     if _has_clients():
+        ct = max(summary.get("clients_total") or 1, 1)
+        client_succ = (summary["clients_approved"] / ct)
         metric_card(
             "Aprobados",
             gr.fmt_int(summary["clients_approved"]),
-            sub=f"usuarios unicos<br>{gr.fmt_int(summary['approved'])} operaciones &middot; {gr.fmt_pct(summary['success_rate'])}",
+            sub=(f"{gr.fmt_pct(client_succ)} de usuarios unicos"
+                 f"<br>{gr.fmt_int(summary['approved'])} operaciones "
+                 f"({gr.fmt_pct(summary['success_rate'])})"),
             kind="good",
         )
     else:
@@ -321,10 +325,14 @@ with k2:
                     sub=gr.fmt_pct(summary["success_rate"]), kind="good")
 with k3:
     if _has_clients():
+        ct = max(summary.get("clients_total") or 1, 1)
+        client_fail = (summary["clients_denied"] / ct)
         metric_card(
             "Negados",
             gr.fmt_int(summary["clients_denied"]),
-            sub=f"usuarios unicos<br>{gr.fmt_int(summary['denied'])} operaciones &middot; {gr.fmt_pct(summary['fail_rate'])}",
+            sub=(f"{gr.fmt_pct(client_fail)} de usuarios unicos"
+                 f"<br>{gr.fmt_int(summary['denied'])} operaciones "
+                 f"({gr.fmt_pct(summary['fail_rate'])})"),
             kind="bad",
         )
     else:
