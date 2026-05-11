@@ -43,6 +43,9 @@ from reportlab.platypus import (
 from motivos import MOTIVO_CATALOG, lookup_motivo, translate_motivo
 
 # ------------------ API config ------------------
+# Bumped when API helpers change. UI lee esto para mostrar version cargada.
+API_FEATURE_VERSION = "v3.1-from-to-split-qs-auth"
+
 DEFAULT_API_URL = os.environ.get(
     "EVO_DEBITS_URL",
     "https://action-branches-api.vercel.app/api/debitos",
@@ -253,31 +256,36 @@ def _extract_records(payload):
     return []
 
 
+# (label, kind, name, value_template). kind: "header" o "qs".
+_AUTH_VARIANTS = [
+    ("x-api-key header",     "header", "x-api-key",     "{t}"),
+    ("?key= query param",    "qs",     "key",           "{t}"),
+    ("?api_key= query param","qs",     "api_key",       "{t}"),
+    ("Authorization Bearer", "header", "Authorization", "Bearer {t}"),
+    ("Authorization raw",    "header", "Authorization", "{t}"),
+    ("X-API-Token header",   "header", "X-API-Token",   "{t}"),
+    ("api-token header",     "header", "api-token",     "{t}"),
+]
+
+
 def _fetch_single_range(url, token, from_str, to_str, page_size=10000, timeout=60):
-    """One API call for [from, to). Tries 5 auth header variants, paginated."""
+    """One API call for [from, to). Tries header AND query-string auth variants."""
     import urllib.parse, urllib.request, urllib.error, json as _json
-    header_variants = [
-        {"x-api-key": token},
-        {"Authorization": f"Bearer {token}"},
-        {"Authorization": token},
-        {"X-API-Token": token},
-        {"api-token": token},
-    ]
-    last_err = "ningun intento"
-    for hv in header_variants:
-        headers = dict(hv)
-        headers["Accept"] = "application/json"
-        headers["User-Agent"] = "evo-debitos/3.0"
+    errors = []
+    for label, kind, name, tmpl in _AUTH_VARIANTS:
+        val = tmpl.format(t=token)
         rows = []
         page = 1
         ok = False
         max_pages = 30
         while page <= max_pages:
-            qs = urllib.parse.urlencode({
-                "from": from_str, "to": to_str,
-                "page": page, "size": page_size,
-            })
-            full = url + "?" + qs
+            qs = {"from": from_str, "to": to_str, "page": page, "size": page_size}
+            headers = {"Accept": "application/json", "User-Agent": "evo-debitos/3.1"}
+            if kind == "header":
+                headers[name] = val
+            else:
+                qs[name] = val
+            full = url + "?" + urllib.parse.urlencode(qs)
             req = urllib.request.Request(full, headers=headers, method="GET")
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -285,11 +293,12 @@ def _fetch_single_range(url, token, from_str, to_str, page_size=10000, timeout=6
                     payload = _json.loads(raw)
                     ok = True
             except urllib.error.HTTPError as e:
-                last_err = f"HTTP {e.code} con header {list(hv)[0]}"
+                body = e.read().decode("utf-8", "replace")[:120].replace("\n", " ")
+                errors.append(f"{label}: HTTP {e.code} {body}")
                 ok = False
                 break
             except Exception as e:
-                last_err = f"{type(e).__name__}: {e}"
+                errors.append(f"{label}: {type(e).__name__}: {e}")
                 ok = False
                 break
             recs = _extract_records(payload)
@@ -308,7 +317,10 @@ def _fetch_single_range(url, token, from_str, to_str, page_size=10000, timeout=6
                 df["__source_file__"] = f"api:{url}?from={from_str}&to={to_str}"
                 return df
             return pd.DataFrame()
-    raise RuntimeError(f"No se pudo conectar a la API. Detalle: {last_err}")
+    raise RuntimeError(
+        "No se pudo conectar a la API. Detalle de cada intento:\n  - "
+        + "\n  - ".join(errors)
+    )
 
 
 def fetch_debitos_range(url, token, from_date, to_date, page_size=10000, timeout=60,
