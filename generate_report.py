@@ -44,7 +44,7 @@ from motivos import MOTIVO_CATALOG, lookup_motivo, translate_motivo
 
 # ------------------ API config ------------------
 # Bumped when API helpers change. UI lee esto para mostrar version cargada.
-API_FEATURE_VERSION = "v3.4-clients-any-status"
+API_FEATURE_VERSION = "v3.6-iso-mixed-precision"
 
 DEFAULT_API_URL = os.environ.get(
     "EVO_DEBITS_URL",
@@ -580,20 +580,34 @@ def coerce(df, cols):
     df = df.copy()
     if "intento" in cols:
         # Parse fechas. Reglas:
-        # - API devuelve ISO 8601 con tz ("2026-05-01T00:00:58Z").
-        # - Excel colombiano trae "D/M/YYYY" (ej. "1/5/2026" = 1 de mayo).
-        # dayfirst=True maneja correctamente ambos formatos.
-        # utc=True + tz_localize(None) deja todo en datetime64[ns] naive.
+        # - API devuelve ISO 8601 ("2026-05-01T00:00:58Z"). dayfirst=True
+        #   con ISO da bug: interpreta "2026-05-01" como YYYY-DD-MM (Jan 5).
+        # - Excel colombiano trae "D/M/YYYY" ("1/5/2026" = 1 de mayo).
+        #   dayfirst=True es necesario para no parsear "1/5/2026" como Ene 5.
+        # Solucion: detectar formato y aplicar dayfirst SOLO si NO es ISO.
+        s_raw = df[cols["intento"]]
+        sample = s_raw.dropna().astype(str).head(20)
+        # ISO si empieza por YYYY- (4 digitos + guion)
+        is_iso = sample.str.match(r"^\d{4}-").any() if len(sample) else False
+        def _parse_dates(series, iso):
+            # pandas tiende a fijar un formato fijo a partir del primer
+            # valor y luego falla con timestamps que mezclan precisiones
+            # (con/sin microsegundos). format="ISO8601" o "mixed" lo evita.
+            kw = {"errors": "coerce", "utc": True}
+            if iso:
+                for fmt in ("ISO8601", "mixed"):
+                    try:
+                        return pd.to_datetime(series, format=fmt, **kw)
+                    except (TypeError, ValueError):
+                        continue
+                return pd.to_datetime(series, **kw)
+            return pd.to_datetime(series, dayfirst=True, **kw)
         try:
-            s = pd.to_datetime(df[cols["intento"]], errors="coerce",
-                               utc=True, dayfirst=True)
+            s = _parse_dates(s_raw, is_iso)
             if getattr(s.dt, "tz", None) is not None:
                 s = s.dt.tz_convert("UTC").dt.tz_localize(None)
         except Exception:
-            try:
-                s = pd.to_datetime(df[cols["intento"]], errors="coerce", dayfirst=True)
-            except Exception:
-                s = pd.to_datetime(df[cols["intento"]], errors="coerce")
+            s = pd.to_datetime(s_raw, errors="coerce", dayfirst=not is_iso)
         df[cols["intento"]] = s
     for k in ("status", "motivo", "tipo", "sede", "marca"):
         if k in cols:

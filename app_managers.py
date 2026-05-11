@@ -364,14 +364,27 @@ def run_pipeline_for_sede(df, sede_label, since, until):
     cols = gr.resolve_columns(df)
     df = gr.coerce(df, cols)
     def _to_naive(s):
-        # Handle tz-aware ISO8601 strings from the new API
+        sample = s.dropna().astype(str).head(20)
+        is_iso = sample.str.match(r"^\d{4}-").any() if len(sample) else False
+        kw = {"errors": "coerce", "utc": True}
         try:
-            x = pd.to_datetime(s, errors="coerce", utc=True)
+            if is_iso:
+                x = None
+                for fmt in ("ISO8601", "mixed"):
+                    try:
+                        x = pd.to_datetime(s, format=fmt, **kw)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+                if x is None:
+                    x = pd.to_datetime(s, **kw)
+            else:
+                x = pd.to_datetime(s, dayfirst=True, **kw)
             if getattr(x.dt, "tz", None) is not None:
                 x = x.dt.tz_convert("UTC").dt.tz_localize(None)
             return x
         except Exception:
-            return pd.to_datetime(s, errors="coerce")
+            return pd.to_datetime(s, errors="coerce", dayfirst=not is_iso)
 
     if "intento" in cols and (since or until):
         d = _to_naive(df[cols["intento"]])
@@ -689,7 +702,20 @@ cols = gr.resolve_columns(df)
 with st.expander("Diagnostico de la carga (debug)"):
     st.write(f"**Filas para la sede seleccionada:** {len(df)}")
     if "intento" in cols:
-        _d = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True, dayfirst=True)
+        _samp_d = df[cols["intento"]].dropna().astype(str).head(20)
+        _iso_d = _samp_d.str.match(r"^\d{4}-").any() if len(_samp_d) else False
+        _d = None
+        if _iso_d:
+            for _fmt in ("ISO8601", "mixed"):
+                try:
+                    _d = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True, format=_fmt)
+                    break
+                except (TypeError, ValueError):
+                    continue
+            if _d is None:
+                _d = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True)
+        else:
+            _d = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True, dayfirst=True)
         if getattr(_d.dt, "tz", None) is not None:
             _d = _d.dt.tz_convert("UTC").dt.tz_localize(None)
         _d_valid = _d.dropna()
@@ -719,7 +745,20 @@ with st.expander("Diagnostico de la carga (debug)"):
 date_col = cols.get("intento")
 if date_col:
     try:
-        dts = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+        _samp = df[date_col].dropna().astype(str).head(20)
+        _iso = _samp.str.match(r"^\d{4}-").any() if len(_samp) else False
+        dts = None
+        if _iso:
+            for _fmt in ("ISO8601", "mixed"):
+                try:
+                    dts = pd.to_datetime(df[date_col], errors="coerce", utc=True, format=_fmt)
+                    break
+                except (TypeError, ValueError):
+                    continue
+            if dts is None:
+                dts = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+        else:
+            dts = pd.to_datetime(df[date_col], errors="coerce", utc=True, dayfirst=True)
         if getattr(dts.dt, "tz", None) is not None:
             dts = dts.dt.tz_convert("UTC").dt.tz_localize(None)
         dts = dts.dropna()
