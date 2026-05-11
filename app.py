@@ -384,42 +384,6 @@ with k4:
         metric_card("Recuperado", gr.fmt_money(summary["amount_approved"]),
                     sub=f"En riesgo: {gr.fmt_money(summary.get('amount_denied', 0))}", kind="gold")
 
-# Debug expander - inspeccion cruda de la columna Valor
-if "valor" in cols:
-    with st.expander("Diagnostico de la columna Valor (debug)"):
-        _raw = df_f[cols["valor"]]
-        st.write("**Tipo y conteo:**")
-        st.write(f"  dtype: `{_raw.dtype}`  ·  total filas: {len(_raw):,}  ·  nulos: {_raw.isna().sum():,}")
-        st.write("**Sample (10 valores crudos head):**")
-        st.code(chr(10).join(repr(v) for v in _raw.head(10).tolist()))
-        if len(_raw) > 10:
-            st.write("**Sample (10 valores aleatorios):**")
-            st.code(chr(10).join(repr(v) for v in _raw.sample(min(10, len(_raw)), random_state=1).tolist()))
-        _parsed = gr.parse_currency_series(_raw)
-        st.write("**Despues de parse_currency_series:**")
-        st.write(f"  min: `{_parsed.min()}`  ·  max: `{_parsed.max()}`  ·  mean: `{_parsed.mean():.2f}`")
-        st.write(f"  sum total: `{_parsed.fillna(0).sum():,.0f}`")
-        st.write(f"  filas con parse OK: {_parsed.notna().sum():,}  ·  NaN: {_parsed.isna().sum():,}")
-        st.write("**Top 10 valores mas grandes despues de parse:**")
-        st.code(chr(10).join(f"{v:>20,.2f}" for v in _parsed.nlargest(10).tolist()))
-
-# ---------- Usuarios nunca aprobados (nuevo, additivo) ----------
-if summary.get("users_never_approved") is not None and summary.get("clients_total"):
-    nv = summary["users_never_approved"]
-    ev = summary["users_ever_approved"]
-    tot = summary["clients_total"]
-    nv_pct = (nv / tot) * 100 if tot else 0
-    ev_pct = (ev / tot) * 100 if tot else 0
-    st.markdown(
-        f"""<div style='background:#FFF8E1; border-left:4px solid #E67E22;
-        padding:10px 14px; border-radius:6px; margin-top:10px; margin-bottom:6px;'>
-        <b>Usuarios nunca aprobados:</b> {gr.fmt_int(nv)} de {gr.fmt_int(tot)}
-        ({nv_pct:.1f}%) &middot;
-        <span style='color:#7A8597;'>Alguna vez aprobados: {gr.fmt_int(ev)} ({ev_pct:.1f}%)</span>
-        </div>""",
-        unsafe_allow_html=True,
-    )
-
 # ---------- Donut + Tendencia ----------
 left, right = st.columns([1.2, 2])
 with left:

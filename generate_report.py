@@ -44,7 +44,7 @@ from motivos import MOTIVO_CATALOG, lookup_motivo, translate_motivo
 
 # ------------------ API config ------------------
 # Bumped when API helpers change. UI lee esto para mostrar version cargada.
-API_FEATURE_VERSION = "v3.7-bogota-tz"
+API_FEATURE_VERSION = "v3.8-exclude-oneshot"
 
 DEFAULT_API_URL = os.environ.get(
     "EVO_DEBITS_URL",
@@ -563,6 +563,8 @@ COL_MAP = {
     "operador": ["Operador de tarjeta", "Operador", "operador_tarjeta"],
     "cliente": ["Cliente", "cliente", "customer"],
     "venta": ["ID de la venta", "Venta", "sale_id", "id_venta"],
+    "prevision": ["Previsión de pagos", "Prevision de pagos", "prevision_pagos",
+                  "PrevisionDePagos", "PrevisionPagos", "Prevision"],
 }
 
 
@@ -618,6 +620,15 @@ def coerce(df, cols):
             df[cols[k]] = df[cols[k]].apply(normalize_text)
     if "marca" in cols:
         df[cols["marca"]] = df[cols["marca"]].astype(str).str.upper().replace({"NAN": np.nan})
+    # Excluir intentos one-shot (sin "Prevision de pagos"). Estos son cobros
+    # no recurrentes que el Excel del cliente filtra antes de reportar, asi
+    # las metricas de la app coinciden con el ground truth operativo.
+    if "prevision" in cols:
+        prev_raw = df[cols["prevision"]]
+        # Normalizar a string para detectar "", "nan", "None"
+        prev_str = prev_raw.astype(str).str.strip()
+        keep = prev_raw.notna() & ~prev_str.isin(("", "nan", "NaT", "None", "null", "<NA>"))
+        df = df.loc[keep].copy()
     return df
 
 

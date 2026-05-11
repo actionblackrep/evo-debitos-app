@@ -697,51 +697,6 @@ st.markdown(
 # Date filter + pipeline
 # =========================================================
 cols = gr.resolve_columns(df)
-
-# Debug temporal: confirma que la sede filtrada captura todas las filas que deberia
-with st.expander("Diagnostico de la carga (debug)"):
-    st.write(f"**Filas para la sede seleccionada:** {len(df)}")
-    if "intento" in cols:
-        _samp_d = df[cols["intento"]].dropna().astype(str).head(20)
-        _iso_d = _samp_d.str.match(r"^\d{4}-").any() if len(_samp_d) else False
-        _d = None
-        if _iso_d:
-            for _fmt in ("ISO8601", "mixed"):
-                try:
-                    _d = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True, format=_fmt)
-                    break
-                except (TypeError, ValueError):
-                    continue
-            if _d is None:
-                _d = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True)
-        else:
-            _d = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True, dayfirst=True)
-        if getattr(_d.dt, "tz", None) is not None:
-            _d = _d.dt.tz_convert("UTC").dt.tz_localize(None)
-        _d_valid = _d.dropna()
-        st.write(f"**Filas con Intento parseable:** {len(_d_valid)}")
-        if len(_d_valid):
-            st.write(f"**Intento min:** {_d_valid.min()}")
-            st.write(f"**Intento max:** {_d_valid.max()}")
-            st.write("**Conteo por dia:**")
-            by_day = _d_valid.dt.normalize().value_counts().sort_index()
-            for day, n in by_day.items():
-                st.text(f"  {day.date()}: {n}")
-    # Variantes de sede en el parquet completo que pueden estar fragmentando la data
-    try:
-        _full_pq = st.session_state.get("shared_pq_path")
-        _sede_col = st.session_state.get("shared_sede_col")
-        if _full_pq and _sede_col:
-            _full_sede = pd.read_parquet(_full_pq, columns=[_sede_col])
-            _key = sede_sel.split()[-1] if " " in sede_sel else sede_sel
-            _matching = _full_sede[_full_sede[_sede_col].astype(str).str.contains(_key, case=False, na=False)]
-            _variants = _matching[_sede_col].value_counts()
-            st.write(f"**Variantes de sede que contienen `{_key}` en el parquet (whole dataset):**")
-            for name, n in _variants.items():
-                st.text(f"  {name!r}: {n}")
-    except Exception as _e:
-        st.text(f"(no se pudo inspeccionar variantes: {_e})")
-
 date_col = cols.get("intento")
 if date_col:
     try:
@@ -855,24 +810,6 @@ with k4:
         metric_card("Recuperado", gr.fmt_money(summary["amount_approved"]),
                     sub=f"En riesgo: {gr.fmt_money(summary.get('amount_denied', 0))}",
                     kind="gold")
-
-
-# ---------- Usuarios nunca aprobados (nuevo, additivo) ----------
-if summary.get("users_never_approved") is not None and summary.get("clients_total"):
-    nv = summary["users_never_approved"]
-    ev = summary["users_ever_approved"]
-    tot = summary["clients_total"]
-    nv_pct = (nv / tot) * 100 if tot else 0
-    ev_pct = (ev / tot) * 100 if tot else 0
-    st.markdown(
-        f"""<div style='background:#FFF8E1; border-left:4px solid #E67E22;
-        padding:10px 14px; border-radius:6px; margin-top:10px; margin-bottom:6px;'>
-        <b>Usuarios nunca aprobados:</b> {gr.fmt_int(nv)} de {gr.fmt_int(tot)}
-        ({nv_pct:.1f}%) &middot;
-        <span style='color:#7A8597;'>Alguna vez aprobados: {gr.fmt_int(ev)} ({ev_pct:.1f}%)</span>
-        </div>""",
-        unsafe_allow_html=True,
-    )
 
 # =========================================================
 # Donut + tendencia
