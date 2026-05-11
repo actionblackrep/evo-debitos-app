@@ -82,6 +82,79 @@ def fmt_money(v):
         return str(v)
 
 
+def parse_currency_to_float(v):
+    """Parse one cell to float. Returns NaN for unparseable.
+
+    Handles:
+      - numbers (int/float) -> as-is
+      - dict with "value"/"amount"/"valor"/"monto"
+      - strings: "$50,000.50" (US), "$50.000,50" (Colombiano),
+        "50.000.000" (CO miles), "50,000" (US miles), "50,5" (CO decimal),
+        "50.5" (decimal), with optional $/USD/COP/spaces.
+    """
+    import math
+    if v is None:
+        return float("nan")
+    if isinstance(v, bool):
+        return float("nan")
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and math.isnan(v):
+            return float("nan")
+        return float(v)
+    if isinstance(v, dict):
+        for k in ("value", "amount", "valor", "monto", "total"):
+            if k in v:
+                return parse_currency_to_float(v[k])
+        return float("nan")
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none", "null", "n/a", "-"):
+        return float("nan")
+    import re
+    # Strip symbols, currency codes and whitespace
+    s = re.sub(r"[\$€₡£¥]", "", s)
+    s = re.sub(r"(?<![A-Za-z])(?:USD|COP|EUR|MXN)(?![A-Za-z])", "", s, flags=re.I)
+    s = re.sub(r"[\s  _]+", "", s)
+    if not s or s == "-":
+        return float("nan")
+    sign = 1
+    if s.startswith("-"):
+        sign = -1
+        s = s[1:]
+    if s.startswith("(") and s.endswith(")"):
+        sign = -1
+        s = s[1:-1]
+    has_comma = "," in s
+    has_dot = "." in s
+    if has_comma and has_dot:
+        # The last occurring separator is the decimal
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif has_comma:
+        parts = s.split(",")
+        if len(parts[-1]) == 3 and all(p.isdigit() for p in parts):
+            s = s.replace(",", "")  # miles
+        else:
+            s = s.replace(",", ".")  # decimal
+    elif has_dot:
+        parts = s.split(".")
+        if len(parts) > 1 and len(parts[-1]) == 3 and all(p.isdigit() for p in parts):
+            s = s.replace(".", "")  # miles
+        # else trato el punto como decimal
+    try:
+        return float(s) * sign
+    except (ValueError, TypeError):
+        return float("nan")
+
+
+def parse_currency_series(series):
+    """Vectorized-ish parser for a pandas Series. Returns float Series."""
+    if pd.api.types.is_numeric_dtype(series):
+        return series.astype(float)
+    return series.map(parse_currency_to_float).astype(float)
+
+
 def normalize_text(s):
     if not isinstance(s, str):
         return s
@@ -123,6 +196,170 @@ def load_data(xlsx_files):
         frames.append(df)
     full = pd.concat(frames, ignore_index=True)
     return full
+
+
+def validate_date_range(from_str, to_str, max_days=5):
+    """Validate a YYYY-MM-DD date range.
+
+    Returns ((from_date, to_date), None) on success
+            or (None, error_message) on failure.
+
+    Rules:
+      - format YYYY-MM-DD strict
+      - to > from (strictly)
+      - (to - from).days <= max_days  (5 by default)
+    """
+    from datetime import date
+    try:
+        f = date.fromisoformat(str(from_str))
+        t = date.fromisoformat(str(to_str))
+    except Exception:
+        return None, "Formato invalido. Usa YYYY-MM-DD para ambas fechas."
+    if t <= f:
+        return None, "`to` (hasta) debe ser estrictamente mayor que `from` (desde)."
+    days = (t - f).days
+    if days > max_days:
+        return None, f"Rango maximo permitido: {max_days} dias. Seleccionaste {days}."
+    return (f, t), None
+
+
+def split_date_ranges_by_month(from_date, to_date):
+    """Split [from_date, to_date) into sub-ranges that never cross a month boundary.
+
+    Devuelve lista de tuplas (sub_from, sub_to). `to_date` exclusivo.
+    Si el rango no cruza meses, devuelve [(from_date, to_date)].
+    """
+    from datetime import date
+    out = []
+    current = from_date
+    while current < to_date:
+        if current.month == 12:
+            next_month_start = date(current.year + 1, 1, 1)
+        else:
+            next_month_start = date(current.year, current.month + 1, 1)
+        chunk_end = min(next_month_start, to_date)
+        out.append((current, chunk_end))
+        current = chunk_end
+    return out
+
+
+def _extract_records(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for k in ("data", "records", "items", "results", "rows"):
+            if isinstance(payload.get(k), list):
+                return payload[k]
+    return []
+
+
+def _fetch_single_range(url, token, from_str, to_str, page_size=10000, timeout=60):
+    """One API call for [from, to). Tries 5 auth header variants, paginated."""
+    import urllib.parse, urllib.request, urllib.error, json as _json
+    header_variants = [
+        {"x-api-key": token},
+        {"Authorization": f"Bearer {token}"},
+        {"Authorization": token},
+        {"X-API-Token": token},
+        {"api-token": token},
+    ]
+    last_err = "ningun intento"
+    for hv in header_variants:
+        headers = dict(hv)
+        headers["Accept"] = "application/json"
+        headers["User-Agent"] = "evo-debitos/3.0"
+        rows = []
+        page = 1
+        ok = False
+        max_pages = 30
+        while page <= max_pages:
+            qs = urllib.parse.urlencode({
+                "from": from_str, "to": to_str,
+                "page": page, "size": page_size,
+            })
+            full = url + "?" + qs
+            req = urllib.request.Request(full, headers=headers, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    raw = r.read()
+                    payload = _json.loads(raw)
+                    ok = True
+            except urllib.error.HTTPError as e:
+                last_err = f"HTTP {e.code} con header {list(hv)[0]}"
+                ok = False
+                break
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                ok = False
+                break
+            recs = _extract_records(payload)
+            if not recs:
+                break
+            rows.extend(recs)
+            if len(recs) < page_size:
+                break
+            page += 1
+        if ok:
+            if rows:
+                try:
+                    df = pd.DataFrame(rows)
+                except Exception:
+                    df = pd.json_normalize(rows)
+                df["__source_file__"] = f"api:{url}?from={from_str}&to={to_str}"
+                return df
+            return pd.DataFrame()
+    raise RuntimeError(f"No se pudo conectar a la API. Detalle: {last_err}")
+
+
+def fetch_debitos_range(url, token, from_date, to_date, page_size=10000, timeout=60,
+                         logger=None):
+    """Fetch debitos for [from_date, to_date).
+
+    La API es un snapshot MENSUAL: cuando el rango cruza meses, splittea
+    automaticamente en sub-rangos por mes y concatena. Llamadas:
+      - (2026-04-25, 2026-05-01)
+      - (2026-05-01, 2026-05-06)
+    Luego concat + dedup por (id, Intento, Status, Valor) si esas columnas existen.
+
+    logger: callable opcional que recibe strings de progreso.
+    """
+    if isinstance(from_date, str):
+        from datetime import date
+        from_date = date.fromisoformat(from_date)
+    if isinstance(to_date, str):
+        from datetime import date
+        to_date = date.fromisoformat(to_date)
+
+    chunks = split_date_ranges_by_month(from_date, to_date)
+    if logger:
+        logger(f"Rango {from_date}..{to_date} dividido en {len(chunks)} llamada(s).")
+
+    dfs = []
+    for f, t in chunks:
+        if logger:
+            logger(f"  Llamando from={f} to={t}")
+        df_chunk = _fetch_single_range(url, token, f.isoformat(), t.isoformat(),
+                                        page_size=page_size, timeout=timeout)
+        if df_chunk is not None and len(df_chunk):
+            if logger:
+                logger(f"    -> {len(df_chunk)} registros")
+            dfs.append(df_chunk)
+        else:
+            if logger:
+                logger("    -> 0 registros")
+
+    if not dfs:
+        return pd.DataFrame()
+
+    result = pd.concat(dfs, ignore_index=True)
+    dedup_cols = [c for c in ("id", "Intento", "Status", "Valor",
+                              "ID de la venta", "Cliente") if c in result.columns]
+    if len(dedup_cols) >= 2 and len(dfs) > 1:
+        before = len(result)
+        result = result.drop_duplicates(subset=dedup_cols)
+        if logger and len(result) != before:
+            logger(f"  Dedup: {before} -> {len(result)} filas")
+    return result
 
 
 def fetch_from_api_v2(url, token, month=None, page_size=10000, timeout=60):
@@ -386,9 +623,11 @@ def compute_summary(df, cols):
         except Exception:
             pass
     if "valor" in cols:
-        res["amount_total"] = float(pd.to_numeric(df[cols["valor"]], errors="coerce").fillna(0).sum())
-        res["amount_approved"] = float(pd.to_numeric(df.loc[approved_mask, cols["valor"]], errors="coerce").fillna(0).sum())
-        res["amount_denied"] = float(pd.to_numeric(df.loc[denied_mask, cols["valor"]], errors="coerce").fillna(0).sum())
+        # Parser robusto (Excel da numero, API puede dar "50.000" o "$50,000.00")
+        valor_clean = parse_currency_series(df[cols["valor"]])
+        res["amount_total"] = float(valor_clean.fillna(0).sum())
+        res["amount_approved"] = float(valor_clean.loc[approved_mask].fillna(0).sum())
+        res["amount_denied"] = float(valor_clean.loc[denied_mask].fillna(0).sum())
     if "intento" in cols:
         dts = df[cols["intento"]].dropna()
         if len(dts):

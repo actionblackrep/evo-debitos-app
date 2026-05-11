@@ -53,10 +53,17 @@ hr {margin: 0.8rem 0;}
 
 # ---------- Helpers ----------
 @st.cache_data(ttl=600, show_spinner=False)
-def load_from_api(api_url, month):
-    """Fetch via v2 endpoint with month + multi-header. Token from env."""
-    df = gr.fetch_from_api_v2(api_url, gr.DEFAULT_API_KEY, month=month)
-    # Vectorized strip on string columns (avoid pyarrow byte-mismatch downstream)
+def load_from_api_range(api_url, from_str, to_str):
+    """Fetch via /api/debitos?from=&to= with auto monthly split. Token from env."""
+    from datetime import date as _dt
+    f = _dt.fromisoformat(from_str)
+    t = _dt.fromisoformat(to_str)
+    chunks_log = []
+    df = gr.fetch_debitos_range(
+        api_url, gr.DEFAULT_API_KEY, f, t,
+        logger=lambda m: chunks_log.append(m),
+    )
+    # Vectorized strip on string columns
     for c in df.columns:
         try:
             s = df[c]
@@ -64,7 +71,7 @@ def load_from_api(api_url, month):
                 df[c] = s.astype("string").str.strip()
         except Exception:
             continue
-    return df
+    return df, chunks_log
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -165,7 +172,7 @@ with st.sidebar:
                             help="Endpoint que devuelve la data de debitos en JSON.")
     if st.button("Limpiar fuente y empezar de nuevo", use_container_width=True):
         for k in ("data_df", "data_source", "data_label", "data_err",
-                  "publish_msg", "publish_ok"):
+                  "publish_msg", "publish_ok", "api_chunks_log"):
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -187,25 +194,42 @@ if df is None:
     with col_api:
         st.markdown("#### 🌐 Cargar desde la API EVO")
         st.caption(f"Endpoint configurado: `{api_url}`")
-        months = gr.available_months(12)
-        api_month = st.selectbox(
-            "Mes a consultar",
-            months,
-            index=0,
-            key="admin_api_month",
-            help="Periodo que se pedira al endpoint (`?month=YYYY-MM`).",
-        )
-        if st.button("Conectar", type="primary", use_container_width=True, key="btn_api"):
-            with st.spinner(f"Consultando API ({api_month})..."):
+        st.caption("Rango por dias (max 5). `Hasta` es exclusivo.")
+        _today = date.today()
+        cda, cdb = st.columns(2)
+        with cda:
+            api_from = st.date_input("Desde", value=_today - timedelta(days=1),
+                                     max_value=_today, key="admin_api_from")
+        with cdb:
+            api_to = st.date_input("Hasta (exclusivo)", value=_today,
+                                   max_value=_today + timedelta(days=1),
+                                   min_value=api_from + timedelta(days=1),
+                                   key="admin_api_to")
+        # Preview de chunks si cruza mes
+        _rng, _err = gr.validate_date_range(api_from.isoformat(), api_to.isoformat())
+        if _err:
+            st.caption(f"⚠ {_err}")
+        else:
+            _chunks = gr.split_date_ranges_by_month(_rng[0], _rng[1])
+            if len(_chunks) > 1:
+                st.caption(f"ℹ Rango cruza mes: se haran {len(_chunks)} llamadas y se concatenaran.")
+        if st.button("Conectar", type="primary", use_container_width=True, key="btn_api",
+                     disabled=bool(_err)):
+            with st.spinner(f"Consultando API {api_from} .. {api_to}..."):
                 try:
-                    df_loaded = load_from_api(api_url, api_month)
+                    df_loaded, chunks_log = load_from_api_range(
+                        api_url, api_from.isoformat(), api_to.isoformat())
                     st.session_state["data_df"] = df_loaded
                     st.session_state["data_source"] = "api"
-                    st.session_state["data_label"] = f"API mes {api_month} ({len(df_loaded):,} registros)"
+                    st.session_state["data_label"] = (
+                        f"API {api_from}..{api_to} ({len(df_loaded):,} registros)"
+                    )
+                    st.session_state["api_chunks_log"] = chunks_log
                     st.session_state.pop("data_err", None)
                     try:
                         ok, msg = shared_cache.publish_dataframe(
-                            df_loaded.copy(), source_label=f"API mes {api_month}"
+                            df_loaded.copy(),
+                            source_label=f"API {api_from}..{api_to}",
                         )
                         st.session_state["publish_msg"] = msg
                         st.session_state["publish_ok"] = ok
@@ -251,7 +275,8 @@ with src_col1:
     st.success(f"{icon}  **Fuente activa:** {src_label}")
 with src_col2:
     if st.button("Cambiar fuente", use_container_width=True):
-        for k in ("data_df", "data_source", "data_label", "data_err", "publish_msg", "publish_ok"):
+        for k in ("data_df", "data_source", "data_label", "data_err",
+                  "publish_msg", "publish_ok", "api_chunks_log"):
             st.session_state.pop(k, None)
         st.rerun()
 if st.session_state.get("publish_msg"):
@@ -260,6 +285,10 @@ if st.session_state.get("publish_msg"):
     else:
         st.error("⚠  Cache compartido no funciona: " + st.session_state["publish_msg"]
                  + "  ·  Revisa los secrets `GITHUB_TOKEN` y `GITHUB_REPO` en Streamlit -> Settings -> Secrets.")
+if st.session_state.get("api_chunks_log"):
+    with st.expander("Detalle de llamadas a la API"):
+        for line in st.session_state["api_chunks_log"]:
+            st.text(line)
 
 cols = gr.resolve_columns(df)
 if "sede" not in cols or "status" not in cols:

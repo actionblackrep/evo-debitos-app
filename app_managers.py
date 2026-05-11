@@ -306,17 +306,25 @@ def _fetch_debitos_v2(url: str, token: str, month: str | None,
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def cached_fetch_api(url: str, month: str) -> str:
-    """Fetch via API and persist as parquet on disk. Returns parquet path.
+def cached_fetch_api_range(url: str, from_str: str, to_str: str):
+    """Fetch via /api/debitos?from=&to=. Auto-split por mes.
 
-    Token is read internally from gr.DEFAULT_API_KEY; never appears in args.
+    Returns (parquet_path, chunks_log).
+    Token leido internamente desde gr.DEFAULT_API_KEY; nunca en los args.
     """
-    df = _fetch_debitos_v2(url, gr.DEFAULT_API_KEY, month=month)
+    from datetime import date as _dt
+    f = _dt.fromisoformat(from_str)
+    t = _dt.fromisoformat(to_str)
+    chunks_log = []
+    df = gr.fetch_debitos_range(
+        url, gr.DEFAULT_API_KEY, f, t,
+        logger=lambda m: chunks_log.append(m),
+    )
     _vectorize_canonicalize(df)
-    h = hashlib.md5(f"{url}::{month}".encode()).hexdigest()[:16]
+    h = hashlib.md5(f"{url}::{from_str}::{to_str}".encode()).hexdigest()[:16]
     pq_path = os.path.join(tempfile.gettempdir(), f"evo_debits_api_{h}.parquet")
     df.to_parquet(pq_path, index=False, compression="snappy")
-    return pq_path
+    return pq_path, chunks_log
 
 
 def available_months(n: int = 12) -> list[str]:
@@ -433,7 +441,8 @@ def metric_card(label, value, sub=None, kind="default"):
 
 def reset_state():
     keys = ["source", "sedes_api", "sedes_shared", "shared_pq_path", "shared_sede_col",
-            "api_error", "shared_error", "used_fallback", "sede_pick", "upl"]
+            "api_error", "shared_error", "used_fallback", "sede_pick", "upl",
+            "api_from", "api_to", "api_chunks_log", "api_month"]
     for k in keys:
         st.session_state.pop(k, None)
 
@@ -538,25 +547,39 @@ if "source" not in st.session_state:
     # --- API EVO ---
     with col_api:
         st.markdown("#### 🌐 API EVO")
-        st.caption("Datos en vivo. Default: mes actual.")
-        months = available_months(12)
-        api_month = st.selectbox(
-            "Mes a consultar",
-            months,
-            index=0,
-            key="api_month_pick",
-            help="Periodo que se pedira al endpoint. La data se filtra luego por sede.",
-        )
-        if st.button("Conectar", use_container_width=True, key="btn_connect_api"):
-            with st.spinner(f"Consultando API ({api_month})..."):
+        st.caption("Rango por dias (max 5). `Hasta` es exclusivo.")
+        _today = date.today()
+        cda, cdb = st.columns(2)
+        with cda:
+            gm_api_from = st.date_input("Desde", value=_today - timedelta(days=1),
+                                        max_value=_today, key="gm_api_from")
+        with cdb:
+            gm_api_to = st.date_input("Hasta (exclusivo)", value=_today,
+                                      max_value=_today + timedelta(days=1),
+                                      min_value=gm_api_from + timedelta(days=1),
+                                      key="gm_api_to")
+        _rng, _err = gr.validate_date_range(gm_api_from.isoformat(), gm_api_to.isoformat())
+        if _err:
+            st.caption(f"⚠ {_err}")
+        else:
+            _chunks = gr.split_date_ranges_by_month(_rng[0], _rng[1])
+            if len(_chunks) > 1:
+                st.caption(f"ℹ Rango cruza mes: {len(_chunks)} llamadas + concat.")
+        if st.button("Conectar", use_container_width=True, key="btn_connect_api",
+                     disabled=bool(_err)):
+            with st.spinner(f"Consultando API {gm_api_from} .. {gm_api_to}..."):
                 try:
-                    pq_path_api = cached_fetch_api(api_url, api_month)
+                    pq_path_api, chunks_log = cached_fetch_api_range(
+                        api_url, gm_api_from.isoformat(), gm_api_to.isoformat()
+                    )
                     sede_col, sedes_list = parquet_list_sedes(pq_path_api)
                     if not sedes_list:
-                        st.error("La API respondio pero sin columna de sede. Revisa el endpoint.")
+                        st.error("La API respondio pero sin columna de sede.")
                     else:
                         st.session_state["source"] = "api"
-                        st.session_state["api_month"] = api_month
+                        st.session_state["api_from"] = gm_api_from.isoformat()
+                        st.session_state["api_to"] = gm_api_to.isoformat()
+                        st.session_state["api_chunks_log"] = chunks_log
                         st.session_state["shared_pq_path"] = pq_path_api
                         st.session_state["shared_sede_col"] = sede_col
                         st.session_state["sedes_shared"] = sedes_list
@@ -571,8 +594,13 @@ if "source" not in st.session_state:
 # =========================================================
 source = st.session_state["source"]
 if source == "api":
-    month_label = st.session_state.get("api_month", "")
-    st.success(f"Fuente: **API EVO** (mes {month_label}).")
+    f_label = st.session_state.get("api_from", "?")
+    t_label = st.session_state.get("api_to", "?")
+    st.success(f"Fuente: **API EVO** ({f_label} a {t_label}, exclusivo).")
+    if st.session_state.get("api_chunks_log"):
+        with st.expander("Detalle de llamadas a la API"):
+            for line in st.session_state["api_chunks_log"]:
+                st.text(line)
 elif source == "shared":
     meta = shared_cache.remote_meta()
     msg = "Fuente: **Datos publicados por el admin**."
