@@ -672,6 +672,24 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Debug temporal: rango real de fechas en los datos despues del filtro de sede.
+with st.expander("Diagnostico: rango de fechas en datos de la sede (debug)"):
+    if "intento" in cols:
+        _d = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True, dayfirst=True)
+        if getattr(_d.dt, "tz", None) is not None:
+            _d = _d.dt.tz_convert("UTC").dt.tz_localize(None)
+        _d_valid = _d.dropna()
+        st.write(f"Total filas: **{len(df)}**")
+        st.write(f"Filas con Intento parseable: **{len(_d_valid)}**")
+        if len(_d_valid):
+            st.write(f"Intento min: **{_d_valid.min()}**")
+            st.write(f"Intento max: **{_d_valid.max()}**")
+            st.write("Conteo por dia:")
+            by_day = _d_valid.dt.normalize().value_counts().sort_index()
+            for day, n in by_day.items():
+                st.text(f"  {day.date()}: {n}")
+    st.write(f"Columnas en df: {list(df.columns)}")
+
 
 # =========================================================
 # Date filter + pipeline
