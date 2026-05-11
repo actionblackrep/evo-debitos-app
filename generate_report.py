@@ -44,7 +44,7 @@ from motivos import MOTIVO_CATALOG, lookup_motivo, translate_motivo
 
 # ------------------ API config ------------------
 # Bumped when API helpers change. UI lee esto para mostrar version cargada.
-API_FEATURE_VERSION = "v3.2-no-pagination-bug"
+API_FEATURE_VERSION = "v3.4-clients-any-status"
 
 DEFAULT_API_URL = os.environ.get(
     "EVO_DEBITS_URL",
@@ -320,15 +320,14 @@ def _fetch_single_range(url, token, from_str, to_str, page_size=10000, timeout=6
                 except Exception:
                     df = pd.json_normalize(rows)
                 df["__source_file__"] = f"api:{url}?from={from_str}&to={to_str}"
-                # Dedupe defensivo: si por bug del API quedaron filas repetidas,
-                # `Id` (o "id"/"ID") garantiza unicidad.
-                for id_col in ("Id", "id", "ID"):
-                    if id_col in df.columns:
-                        before = len(df)
-                        df = df.drop_duplicates(subset=[id_col]).reset_index(drop=True)
-                        if len(df) != before:
-                            df.attrs["dedup_dropped"] = before - len(df)
-                        break
+                # Dedupe SOLO de filas 100% identicas (defensivo contra paginacion
+                # rota). NUNCA por subset=[Id] porque `Id` no es row-unique en
+                # esta API: es algo cercano a id_cliente, y dedup por ahi
+                # colapsa retries legitimos.
+                before = len(df)
+                df = df.drop_duplicates().reset_index(drop=True)
+                if len(df) != before:
+                    df.attrs["dedup_dropped"] = before - len(df)
                 return df
             return pd.DataFrame()
     raise RuntimeError(
@@ -580,15 +579,21 @@ def resolve_columns(df):
 def coerce(df, cols):
     df = df.copy()
     if "intento" in cols:
-        # Parse with utc=True to handle mixed tz-aware/naive ISO8601 strings
-        # (the new endpoint returns dates like "2026-04-15T10:30:00Z").
-        # Then drop the tz so downstream comparisons against naive timestamps work.
+        # Parse fechas. Reglas:
+        # - API devuelve ISO 8601 con tz ("2026-05-01T00:00:58Z").
+        # - Excel colombiano trae "D/M/YYYY" (ej. "1/5/2026" = 1 de mayo).
+        # dayfirst=True maneja correctamente ambos formatos.
+        # utc=True + tz_localize(None) deja todo en datetime64[ns] naive.
         try:
-            s = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True)
+            s = pd.to_datetime(df[cols["intento"]], errors="coerce",
+                               utc=True, dayfirst=True)
             if getattr(s.dt, "tz", None) is not None:
                 s = s.dt.tz_convert("UTC").dt.tz_localize(None)
         except Exception:
-            s = pd.to_datetime(df[cols["intento"]], errors="coerce")
+            try:
+                s = pd.to_datetime(df[cols["intento"]], errors="coerce", dayfirst=True)
+            except Exception:
+                s = pd.to_datetime(df[cols["intento"]], errors="coerce")
         df[cols["intento"]] = s
     for k in ("status", "motivo", "tipo", "sede", "marca"):
         if k in cols:
@@ -638,12 +643,13 @@ def compute_summary(df, cols):
                 df.loc[approved_mask, id_col_local].dropna().astype(str).unique()
             )
             res["clients_total"] = len(all_users)
+            # clients_approved/denied = usuarios con AL MENOS 1 intento de ese
+            # status. Coincide con la definicion del negocio y con groupby
+            # del Excel. Los buckets pueden traslapar (un usuario con 4 aprob
+            # + 1 negado cuenta en ambos), asi suma > clients_total es normal.
+            res["clients_approved"] = len(users_approved_ever)
             res["clients_denied"] = len(users_denied)
-            res["clients_approved"] = len(all_users - users_denied)
-            # Ever-approved vs never-approved (independiente de los buckets
-            # mutuamente exclusivos clients_approved/clients_denied).
-            # users_never_approved incluye tambien usuarios cuyos intentos
-            # fueron Pendiente/Error sin ningun Aprobado.
+            # Estos dos SI son mutuamente exclusivos (any-aprobado vs zero-aprobado).
             res["users_ever_approved"] = len(users_approved_ever)
             res["users_never_approved"] = len(all_users - users_approved_ever)
         except Exception:
