@@ -306,10 +306,13 @@ def _fetch_debitos_v2(url: str, token: str, month: str | None,
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def cached_fetch_api_range(url: str, from_str: str, to_str: str):
+def cached_fetch_api_range(url: str, from_str: str, to_str: str,
+                            _module_version: str = ""):
     """Fetch via /api/debitos?from=&to=. Auto-split por mes.
 
     Returns (parquet_path, chunks_log).
+    `_module_version` se pasa para que cualquier bump de API_FEATURE_VERSION
+    invalide automaticamente el cache (evita servir parquets viejos tras un fix).
     Token leido internamente desde gr.DEFAULT_API_KEY; nunca en los args.
     """
     from datetime import date as _dt
@@ -457,6 +460,7 @@ with st.sidebar:
     st.title("Configuracion")
     st.caption("Token y URL gestionados por el backend.")
     st.code(api_url, language=None)
+    st.caption(f"generate_report: `{getattr(gr, 'API_FEATURE_VERSION', 'pre-v3 (desactualizado)')}`")
     if st.button("Recargar datos", type="primary", use_container_width=True,
                  help="Limpia todos los caches locales y reinicia la fuente."):
         reset_state()
@@ -558,19 +562,25 @@ if "source" not in st.session_state:
                                       max_value=_today + timedelta(days=1),
                                       min_value=gm_api_from + timedelta(days=1),
                                       key="gm_api_to")
-        _rng, _err = gr.validate_date_range(gm_api_from.isoformat(), gm_api_to.isoformat())
-        if _err:
-            st.caption(f"⚠ {_err}")
+        if not hasattr(gr, "validate_date_range"):
+            st.caption("⚠ `generate_report.py` desactualizado en el deploy. "
+                       "Push del archivo al repo y espera el redeploy.")
+            _rng, _err = None, "outdated"
         else:
-            _chunks = gr.split_date_ranges_by_month(_rng[0], _rng[1])
-            if len(_chunks) > 1:
-                st.caption(f"ℹ Rango cruza mes: {len(_chunks)} llamadas + concat.")
+            _rng, _err = gr.validate_date_range(gm_api_from.isoformat(), gm_api_to.isoformat())
+            if _err:
+                st.caption(f"⚠ {_err}")
+            elif hasattr(gr, "split_date_ranges_by_month"):
+                _chunks = gr.split_date_ranges_by_month(_rng[0], _rng[1])
+                if len(_chunks) > 1:
+                    st.caption(f"ℹ Rango cruza mes: {len(_chunks)} llamadas + concat.")
         if st.button("Conectar", use_container_width=True, key="btn_connect_api",
                      disabled=bool(_err)):
             with st.spinner(f"Consultando API {gm_api_from} .. {gm_api_to}..."):
                 try:
                     pq_path_api, chunks_log = cached_fetch_api_range(
-                        api_url, gm_api_from.isoformat(), gm_api_to.isoformat()
+                        api_url, gm_api_from.isoformat(), gm_api_to.isoformat(),
+                        _module_version=getattr(gr, "API_FEATURE_VERSION", "?"),
                     )
                     sede_col, sedes_list = parquet_list_sedes(pq_path_api)
                     if not sedes_list:

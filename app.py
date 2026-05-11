@@ -53,8 +53,12 @@ hr {margin: 0.8rem 0;}
 
 # ---------- Helpers ----------
 @st.cache_data(ttl=600, show_spinner=False)
-def load_from_api_range(api_url, from_str, to_str):
-    """Fetch via /api/debitos?from=&to= with auto monthly split. Token from env."""
+def load_from_api_range(api_url, from_str, to_str, _module_version: str = ""):
+    """Fetch via /api/debitos?from=&to= with auto monthly split. Token from env.
+
+    `_module_version` invalida el cache automaticamente cuando se bumpea
+    API_FEATURE_VERSION en generate_report.py (evita servir respuestas viejas).
+    """
     from datetime import date as _dt
     f = _dt.fromisoformat(from_str)
     t = _dt.fromisoformat(to_str)
@@ -170,6 +174,7 @@ with st.sidebar:
     api_url = st.text_input("URL del endpoint",
                             value=gr.DEFAULT_API_URL,
                             help="Endpoint que devuelve la data de debitos en JSON.")
+    st.caption(f"generate_report: `{getattr(gr, 'API_FEATURE_VERSION', 'pre-v3 (desactualizado)')}`")
     if st.button("Limpiar fuente y empezar de nuevo", use_container_width=True):
         for k in ("data_df", "data_source", "data_label", "data_err",
                   "publish_msg", "publish_ok", "api_chunks_log"):
@@ -205,20 +210,27 @@ if df is None:
                                    max_value=_today + timedelta(days=1),
                                    min_value=api_from + timedelta(days=1),
                                    key="admin_api_to")
-        # Preview de chunks si cruza mes
-        _rng, _err = gr.validate_date_range(api_from.isoformat(), api_to.isoformat())
-        if _err:
-            st.caption(f"⚠ {_err}")
+        # Preview de chunks si cruza mes. Defensivo si generate_report.py esta desactualizado.
+        if not hasattr(gr, "validate_date_range"):
+            st.caption("⚠ `generate_report.py` desactualizado en el deploy. "
+                       "Push del archivo al repo y espera el redeploy.")
+            _rng, _err = None, "outdated"
         else:
-            _chunks = gr.split_date_ranges_by_month(_rng[0], _rng[1])
-            if len(_chunks) > 1:
-                st.caption(f"ℹ Rango cruza mes: se haran {len(_chunks)} llamadas y se concatenaran.")
+            _rng, _err = gr.validate_date_range(api_from.isoformat(), api_to.isoformat())
+            if _err:
+                st.caption(f"⚠ {_err}")
+            elif hasattr(gr, "split_date_ranges_by_month"):
+                _chunks = gr.split_date_ranges_by_month(_rng[0], _rng[1])
+                if len(_chunks) > 1:
+                    st.caption(f"ℹ Rango cruza mes: se haran {len(_chunks)} llamadas y se concatenaran.")
         if st.button("Conectar", type="primary", use_container_width=True, key="btn_api",
                      disabled=bool(_err)):
             with st.spinner(f"Consultando API {api_from} .. {api_to}..."):
                 try:
                     df_loaded, chunks_log = load_from_api_range(
-                        api_url, api_from.isoformat(), api_to.isoformat())
+                        api_url, api_from.isoformat(), api_to.isoformat(),
+                        _module_version=getattr(gr, "API_FEATURE_VERSION", "?"),
+                    )
                     st.session_state["data_df"] = df_loaded
                     st.session_state["data_source"] = "api"
                     st.session_state["data_label"] = (
@@ -371,6 +383,25 @@ with k4:
     if "amount_approved" in summary:
         metric_card("Recuperado", gr.fmt_money(summary["amount_approved"]),
                     sub=f"En riesgo: {gr.fmt_money(summary.get('amount_denied', 0))}", kind="gold")
+
+# Debug expander - inspeccion cruda de la columna Valor
+if "valor" in cols:
+    with st.expander("Diagnostico de la columna Valor (debug)"):
+        _raw = df_f[cols["valor"]]
+        st.write("**Tipo y conteo:**")
+        st.write(f"  dtype: `{_raw.dtype}`  ·  total filas: {len(_raw):,}  ·  nulos: {_raw.isna().sum():,}")
+        st.write("**Sample (10 valores crudos head):**")
+        st.code(chr(10).join(repr(v) for v in _raw.head(10).tolist()))
+        if len(_raw) > 10:
+            st.write("**Sample (10 valores aleatorios):**")
+            st.code(chr(10).join(repr(v) for v in _raw.sample(min(10, len(_raw)), random_state=1).tolist()))
+        _parsed = gr.parse_currency_series(_raw)
+        st.write("**Despues de parse_currency_series:**")
+        st.write(f"  min: `{_parsed.min()}`  ·  max: `{_parsed.max()}`  ·  mean: `{_parsed.mean():.2f}`")
+        st.write(f"  sum total: `{_parsed.fillna(0).sum():,.0f}`")
+        st.write(f"  filas con parse OK: {_parsed.notna().sum():,}  ·  NaN: {_parsed.isna().sum():,}")
+        st.write("**Top 10 valores mas grandes despues de parse:**")
+        st.code(chr(10).join(f"{v:>20,.2f}" for v in _parsed.nlargest(10).tolist()))
 
 # ---------- Usuarios nunca aprobados (nuevo, additivo) ----------
 if summary.get("users_never_approved") is not None and summary.get("clients_total"):
