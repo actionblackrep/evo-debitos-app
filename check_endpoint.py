@@ -89,6 +89,9 @@ def fetch_one(url, token, from_s, to_s, page_size=1000):
             if not recs:
                 break
             rows.extend(recs)
+            if len(recs) > page_size:
+                print(f"     [WARN] API ignora page/size (recibido {len(recs)} > pedido {page_size}). Stop.")
+                break
             if len(recs) < page_size:
                 break
             page += 1

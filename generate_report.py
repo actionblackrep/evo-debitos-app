@@ -44,7 +44,7 @@ from motivos import MOTIVO_CATALOG, lookup_motivo, translate_motivo
 
 # ------------------ API config ------------------
 # Bumped when API helpers change. UI lee esto para mostrar version cargada.
-API_FEATURE_VERSION = "v3.1-from-to-split-qs-auth"
+API_FEATURE_VERSION = "v3.2-no-pagination-bug"
 
 DEFAULT_API_URL = os.environ.get(
     "EVO_DEBITS_URL",
@@ -305,6 +305,11 @@ def _fetch_single_range(url, token, from_str, to_str, page_size=10000, timeout=6
             if not recs:
                 break
             rows.extend(recs)
+            # Si el API devolvio MAS de lo que pedimos en page_size, esta
+            # ignorando la paginacion y nos esta dando el set completo cada vez.
+            # Romper para no acumular duplicados (sintoma: card Recuperado x30).
+            if len(recs) > page_size:
+                break
             if len(recs) < page_size:
                 break
             page += 1
@@ -315,6 +320,15 @@ def _fetch_single_range(url, token, from_str, to_str, page_size=10000, timeout=6
                 except Exception:
                     df = pd.json_normalize(rows)
                 df["__source_file__"] = f"api:{url}?from={from_str}&to={to_str}"
+                # Dedupe defensivo: si por bug del API quedaron filas repetidas,
+                # `Id` (o "id"/"ID") garantiza unicidad.
+                for id_col in ("Id", "id", "ID"):
+                    if id_col in df.columns:
+                        before = len(df)
+                        df = df.drop_duplicates(subset=[id_col]).reset_index(drop=True)
+                        if len(df) != before:
+                            df.attrs["dedup_dropped"] = before - len(df)
+                        break
                 return df
             return pd.DataFrame()
     raise RuntimeError(
