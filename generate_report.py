@@ -44,7 +44,7 @@ from motivos import MOTIVO_CATALOG, lookup_motivo, translate_motivo
 
 # ------------------ API config ------------------
 # Bumped when API helpers change. UI lee esto para mostrar version cargada.
-API_FEATURE_VERSION = "v3.6-iso-mixed-precision"
+API_FEATURE_VERSION = "v3.7-bogota-tz"
 
 DEFAULT_API_URL = os.environ.get(
     "EVO_DEBITS_URL",
@@ -590,9 +590,6 @@ def coerce(df, cols):
         # ISO si empieza por YYYY- (4 digitos + guion)
         is_iso = sample.str.match(r"^\d{4}-").any() if len(sample) else False
         def _parse_dates(series, iso):
-            # pandas tiende a fijar un formato fijo a partir del primer
-            # valor y luego falla con timestamps que mezclan precisiones
-            # (con/sin microsegundos). format="ISO8601" o "mixed" lo evita.
             kw = {"errors": "coerce", "utc": True}
             if iso:
                 for fmt in ("ISO8601", "mixed"):
@@ -605,7 +602,14 @@ def coerce(df, cols):
         try:
             s = _parse_dates(s_raw, is_iso)
             if getattr(s.dt, "tz", None) is not None:
-                s = s.dt.tz_convert("UTC").dt.tz_localize(None)
+                # Convert UTC -> America/Bogota (UTC-5) so day grouping coincide
+                # con el calendario local que usa el Excel. Sin esto, records
+                # entre 00:00-04:59 UTC quedan asignados al dia siguiente en UTC
+                # y aparecen como duplicados o desplazados vs el Excel.
+                if is_iso:
+                    s = s.dt.tz_convert("America/Bogota").dt.tz_localize(None)
+                else:
+                    s = s.dt.tz_convert("UTC").dt.tz_localize(None)
         except Exception:
             s = pd.to_datetime(s_raw, errors="coerce", dayfirst=not is_iso)
         df[cols["intento"]] = s
