@@ -558,16 +558,18 @@ if "source" not in st.session_state:
             gm_api_from = st.date_input("Desde", value=_today - timedelta(days=1),
                                         max_value=_today, key="gm_api_from")
         with cdb:
-            gm_api_to = st.date_input("Hasta (exclusivo)", value=_today,
-                                      max_value=_today + timedelta(days=1),
-                                      min_value=gm_api_from + timedelta(days=1),
+            gm_api_to = st.date_input("Hasta (inclusivo)", value=_today,
+                                      max_value=_today,
+                                      min_value=gm_api_from,
                                       key="gm_api_to")
+        # API usa `to` exclusivo. Convertimos: hasta+1 dia.
+        _api_to_exclusive = (gm_api_to + timedelta(days=1)).isoformat()
         if not hasattr(gr, "validate_date_range"):
             st.caption("⚠ `generate_report.py` desactualizado en el deploy. "
                        "Push del archivo al repo y espera el redeploy.")
             _rng, _err = None, "outdated"
         else:
-            _rng, _err = gr.validate_date_range(gm_api_from.isoformat(), gm_api_to.isoformat())
+            _rng, _err = gr.validate_date_range(gm_api_from.isoformat(), _api_to_exclusive)
             if _err:
                 st.caption(f"⚠ {_err}")
             elif hasattr(gr, "split_date_ranges_by_month"):
@@ -576,10 +578,10 @@ if "source" not in st.session_state:
                     st.caption(f"ℹ Rango cruza mes: {len(_chunks)} llamadas + concat.")
         if st.button("Conectar", use_container_width=True, key="btn_connect_api",
                      disabled=bool(_err)):
-            with st.spinner(f"Consultando API {gm_api_from} .. {gm_api_to}..."):
+            with st.spinner(f"Consultando API {gm_api_from} .. {gm_api_to} (inclusivo)..."):
                 try:
                     pq_path_api, chunks_log = cached_fetch_api_range(
-                        api_url, gm_api_from.isoformat(), gm_api_to.isoformat(),
+                        api_url, gm_api_from.isoformat(), _api_to_exclusive,
                         _module_version=getattr(gr, "API_FEATURE_VERSION", "?"),
                     )
                     sede_col, sedes_list = parquet_list_sedes(pq_path_api)
@@ -588,7 +590,7 @@ if "source" not in st.session_state:
                     else:
                         st.session_state["source"] = "api"
                         st.session_state["api_from"] = gm_api_from.isoformat()
-                        st.session_state["api_to"] = gm_api_to.isoformat()
+                        st.session_state["api_to"] = _api_to_exclusive  # exclusivo
                         st.session_state["api_chunks_log"] = chunks_log
                         st.session_state["shared_pq_path"] = pq_path_api
                         st.session_state["shared_sede_col"] = sede_col
@@ -606,7 +608,12 @@ source = st.session_state["source"]
 if source == "api":
     f_label = st.session_state.get("api_from", "?")
     t_label = st.session_state.get("api_to", "?")
-    st.success(f"Fuente: **API EVO** ({f_label} a {t_label}, exclusivo).")
+    try:
+        from datetime import date as _d, timedelta as _td
+        t_inclusive = (_d.fromisoformat(t_label) - _td(days=1)).isoformat()
+    except Exception:
+        t_inclusive = t_label
+    st.success(f"Fuente: **API EVO** ({f_label} a {t_inclusive}, inclusivo).")
     if st.session_state.get("api_chunks_log"):
         with st.expander("Detalle de llamadas a la API"):
             for line in st.session_state["api_chunks_log"]:
@@ -672,29 +679,43 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Debug temporal: rango real de fechas en los datos despues del filtro de sede.
-with st.expander("Diagnostico: rango de fechas en datos de la sede (debug)"):
-    if "intento" in cols:
-        _d = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True, dayfirst=True)
-        if getattr(_d.dt, "tz", None) is not None:
-            _d = _d.dt.tz_convert("UTC").dt.tz_localize(None)
-        _d_valid = _d.dropna()
-        st.write(f"Total filas: **{len(df)}**")
-        st.write(f"Filas con Intento parseable: **{len(_d_valid)}**")
-        if len(_d_valid):
-            st.write(f"Intento min: **{_d_valid.min()}**")
-            st.write(f"Intento max: **{_d_valid.max()}**")
-            st.write("Conteo por dia:")
-            by_day = _d_valid.dt.normalize().value_counts().sort_index()
-            for day, n in by_day.items():
-                st.text(f"  {day.date()}: {n}")
-    st.write(f"Columnas en df: {list(df.columns)}")
-
 
 # =========================================================
 # Date filter + pipeline
 # =========================================================
 cols = gr.resolve_columns(df)
+
+# Debug temporal: confirma que la sede filtrada captura todas las filas que deberia
+with st.expander("Diagnostico de la carga (debug)"):
+    st.write(f"**Filas para la sede seleccionada:** {len(df)}")
+    if "intento" in cols:
+        _d = pd.to_datetime(df[cols["intento"]], errors="coerce", utc=True, dayfirst=True)
+        if getattr(_d.dt, "tz", None) is not None:
+            _d = _d.dt.tz_convert("UTC").dt.tz_localize(None)
+        _d_valid = _d.dropna()
+        st.write(f"**Filas con Intento parseable:** {len(_d_valid)}")
+        if len(_d_valid):
+            st.write(f"**Intento min:** {_d_valid.min()}")
+            st.write(f"**Intento max:** {_d_valid.max()}")
+            st.write("**Conteo por dia:**")
+            by_day = _d_valid.dt.normalize().value_counts().sort_index()
+            for day, n in by_day.items():
+                st.text(f"  {day.date()}: {n}")
+    # Variantes de sede en el parquet completo que pueden estar fragmentando la data
+    try:
+        _full_pq = st.session_state.get("shared_pq_path")
+        _sede_col = st.session_state.get("shared_sede_col")
+        if _full_pq and _sede_col:
+            _full_sede = pd.read_parquet(_full_pq, columns=[_sede_col])
+            _key = sede_sel.split()[-1] if " " in sede_sel else sede_sel
+            _matching = _full_sede[_full_sede[_sede_col].astype(str).str.contains(_key, case=False, na=False)]
+            _variants = _matching[_sede_col].value_counts()
+            st.write(f"**Variantes de sede que contienen `{_key}` en el parquet (whole dataset):**")
+            for name, n in _variants.items():
+                st.text(f"  {name!r}: {n}")
+    except Exception as _e:
+        st.text(f"(no se pudo inspeccionar variantes: {_e})")
+
 date_col = cols.get("intento")
 if date_col:
     try:
