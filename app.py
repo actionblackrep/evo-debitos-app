@@ -422,21 +422,25 @@ with right:
 st.markdown("### 🔎 Motivos de rechazo")
 if not motivos.empty:
     table = motivos.head(15)[["Ranking", "MotivoES", "Veces", "Pct", "Responsable", "Accion"]].copy()
-    table.columns = ["#", "Motivo (ES)", "Veces", "% del total negado", "Responsable", "Accion sugerida"]
-    table["Veces"] = table["Veces"].apply(gr.fmt_int)
-    table["% del total negado"] = (table["% del total negado"]).apply(lambda x: f"{x*100:.2f}%") if False else (motivos.head(15)["Pct"]*100).round(2).astype(str) + "%"
+    table.columns = ["#", "Motivo (ES)", "Usuarios unicos", "% de usuarios negados", "Responsable", "Accion sugerida"]
+    table["Usuarios unicos"] = table["Usuarios unicos"].apply(gr.fmt_int)
+    table["% de usuarios negados"] = (motivos.head(15)["Pct"]*100).round(2).astype(str) + "%"
     st.dataframe(table, use_container_width=True, hide_index=True)
 else:
     st.info("No hay motivos negados en este corte.")
 
 # ---------- Sedes (solo si todas) ----------
 if not sede_arg and not sedes.empty:
-    st.markdown("### 🏢 Desempeno por sede")
+    st.markdown("### 🏢 Desempeno por sede (usuarios unicos)")
+    st.caption("Total/Aprobado/Negado = usuarios distintos. Un mismo usuario "
+               "puede contar en Aprobado y Negado si tuvo intentos de ambos tipos.")
     s = sedes.copy()
     s["Tasa exito"] = (s["TasaExito"] * 100).round(1).astype(str) + "%"
     for c in ("Total", "Aprobado", "Negado"):
         s[c] = s[c].apply(gr.fmt_int)
-    st.dataframe(s[["Sede", "Total", "Aprobado", "Negado", "Tasa exito"]],
+    s = s.rename(columns={"Total": "Usuarios", "Aprobado": "Con aprobado",
+                          "Negado": "Con negado"})
+    st.dataframe(s[["Sede", "Usuarios", "Con aprobado", "Con negado", "Tasa exito"]],
                  use_container_width=True, hide_index=True)
 
 # ---------- Descargas ----------

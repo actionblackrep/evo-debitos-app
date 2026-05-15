@@ -868,10 +868,10 @@ if not motivos.empty:
     table = motivos.head(15)[
         ["Ranking", "MotivoES", "Veces", "Pct", "Responsable", "Accion"]
     ].copy()
-    table.columns = ["#", "Motivo (ES)", "Veces", "% del total negado",
+    table.columns = ["#", "Motivo (ES)", "Usuarios unicos", "% de usuarios negados",
                      "Responsable", "Accion sugerida"]
-    table["Veces"] = table["Veces"].apply(gr.fmt_int)
-    table["% del total negado"] = (motivos.head(15)["Pct"] * 100).round(2).astype(str) + "%"
+    table["Usuarios unicos"] = table["Usuarios unicos"].apply(gr.fmt_int)
+    table["% de usuarios negados"] = (motivos.head(15)["Pct"] * 100).round(2).astype(str) + "%"
     st.dataframe(table, use_container_width=True, hide_index=True)
 else:
     st.info("No hay motivos negados en este corte.")

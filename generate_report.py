@@ -44,7 +44,7 @@ from motivos import MOTIVO_CATALOG, lookup_motivo, translate_motivo
 
 # ------------------ API config ------------------
 # Bumped when API helpers change. UI lee esto para mostrar version cargada.
-API_FEATURE_VERSION = "v3.8-exclude-oneshot"
+API_FEATURE_VERSION = "v4.1-pdf-top15-franq"
 
 DEFAULT_API_URL = os.environ.get(
     "EVO_DEBITS_URL",
@@ -552,6 +552,13 @@ def fetch_from_api(url, api_key, sede=None, since=None, until=None, page_size=50
     return df
 
 
+ID_CLIENT_CANDIDATES = [
+    "id_client", "id_cliente", "client_id", "Cliente_id",
+    "id", "ID", "Id", "user_id", "userId", "userid",
+    "id_usuario", "ID_usuario", "idUsuario",
+]
+
+
 COL_MAP = {
     "intento": ["Intento", "Fecha", "Date", "intento", "fecha", "date", "attempt_date"],
     "valor": ["Valor", "Monto", "Amount", "valor", "amount", "monto"],
@@ -687,8 +694,34 @@ def compute_summary(df, cols):
         # Parser robusto (Excel da numero, API puede dar "50.000" o "$50,000.00")
         valor_clean = parse_currency_series(df[cols["valor"]])
         res["amount_total"] = float(valor_clean.fillna(0).sum())
-        res["amount_approved"] = float(valor_clean.loc[approved_mask].fillna(0).sum())
-        res["amount_denied"] = float(valor_clean.loc[denied_mask].fillna(0).sum())
+        # Per-intento (los reintentos del mismo cobro inflan estas cifras)
+        res["amount_approved_attempts"] = float(valor_clean.loc[approved_mask].fillna(0).sum())
+        res["amount_denied_attempts"] = float(valor_clean.loc[denied_mask].fillna(0).sum())
+
+        # Per-venta unica (cada cobro cuenta UNA vez, independiente de reintentos).
+        # Recuperado = ventas con >=1 aprobado.
+        # En riesgo  = ventas sin ningun aprobado.
+        # Esto refleja el dinero real, no la suma de reintentos.
+        if "venta" in cols:
+            sale_col = cols["venta"]
+            tmp = pd.DataFrame({
+                "_sale": df[sale_col].values,
+                "_valor": valor_clean.values,
+                "_ap": approved_mask.values,
+            })
+            # Para cada venta: cualquier intento aprobado, y un Valor representativo
+            ever_approved = tmp.groupby("_sale", dropna=False)["_ap"].any()
+            # Tomamos el max del Valor por venta (defensivo si hay diffs)
+            sale_valor = tmp.groupby("_sale", dropna=False)["_valor"].max()
+            res["amount_approved"] = float(sale_valor[ever_approved].fillna(0).sum())
+            res["amount_denied"] = float(sale_valor[~ever_approved].fillna(0).sum())
+            res["sales_total"] = int(len(sale_valor))
+            res["sales_recovered"] = int(ever_approved.sum())
+            res["sales_at_risk"] = int((~ever_approved).sum())
+        else:
+            # Sin ID de la venta no se puede agrupar; usar per-intento como fallback
+            res["amount_approved"] = res["amount_approved_attempts"]
+            res["amount_denied"] = res["amount_denied_attempts"]
     if "intento" in cols:
         dts = df[cols["intento"]].dropna()
         if len(dts):
@@ -698,33 +731,72 @@ def compute_summary(df, cols):
 
 
 def by_sede(df, cols, approved_mask, denied_mask):
+    """Aggregate by sede.
+
+    Total/Aprobado/Negado ahora cuentan USUARIOS UNICOS (no intentos):
+      - Total    = usuarios distintos en la sede
+      - Aprobado = usuarios con >= 1 intento aprobado
+      - Negado   = usuarios con >= 1 intento negado
+    Aprobado + Negado puede exceder Total cuando un mismo usuario tiene ambos.
+    TasaExito = Aprobado / Total (fraccion de usuarios que en algun momento
+    fueron aprobados en esa sede). Sin id de cliente cae al modo per-intento.
+    """
     if "sede" not in cols:
         return pd.DataFrame()
-    g = df.groupby(cols["sede"], dropna=False)
-    out = pd.DataFrame({
-        "Sede": g.size().index,
-        "Total": g.size().values,
-    })
-    appr = df[approved_mask].groupby(cols["sede"]).size().reindex(out["Sede"]).fillna(0).astype(int).values
-    den = df[denied_mask].groupby(cols["sede"]).size().reindex(out["Sede"]).fillna(0).astype(int).values
-    out["Aprobado"] = appr
-    out["Negado"] = den
+    id_col = next((c for c in ID_CLIENT_CANDIDATES if c in df.columns), None)
+    if id_col:
+        g = df.groupby(cols["sede"], dropna=False)
+        total = g[id_col].nunique()
+        appr = (df.loc[approved_mask].groupby(cols["sede"], dropna=False)[id_col]
+                 .nunique().reindex(total.index).fillna(0).astype(int))
+        den = (df.loc[denied_mask].groupby(cols["sede"], dropna=False)[id_col]
+                 .nunique().reindex(total.index).fillna(0).astype(int))
+        out = pd.DataFrame({
+            "Sede": total.index,
+            "Total": total.values,
+            "Aprobado": appr.values,
+            "Negado": den.values,
+        })
+    else:
+        g = df.groupby(cols["sede"], dropna=False)
+        out = pd.DataFrame({"Sede": g.size().index, "Total": g.size().values})
+        out["Aprobado"] = (df[approved_mask].groupby(cols["sede"]).size()
+                            .reindex(out["Sede"]).fillna(0).astype(int).values)
+        out["Negado"] = (df[denied_mask].groupby(cols["sede"]).size()
+                          .reindex(out["Sede"]).fillna(0).astype(int).values)
     out["TasaExito"] = np.where(out["Total"] > 0, out["Aprobado"] / out["Total"], 0)
-    out["TasaFallo"] = 1 - out["TasaExito"]
+    out["TasaFallo"] = np.where(out["Total"] > 0, out["Negado"] / out["Total"], 0)
     out = out.sort_values(["Total"], ascending=False).reset_index(drop=True)
     return out
 
 
 def by_motivo(df, cols, denied_mask):
+    """Aggregate denied attempts by motivo.
+
+    Cuenta USUARIOS UNICOS por motivo (no intentos). Si la columna `Veces`
+    aparece en consumidores aguas abajo (PDF, tablas), su semantica ahora es
+    "usuarios unicos con al menos un intento negado por este motivo". El
+    porcentaje (`Pct`) se calcula contra el total de usuarios unicos negados.
+    """
     if "motivo" not in cols:
         return pd.DataFrame()
-    sub = df.loc[denied_mask, cols["motivo"]].fillna("Sin motivo registrado")
-    counts = sub.value_counts()
-    total = counts.sum()
+    sub = df.loc[denied_mask].copy()
+    sub[cols["motivo"]] = sub[cols["motivo"]].fillna("Sin motivo registrado")
+
+    id_col = next((c for c in ID_CLIENT_CANDIDATES if c in sub.columns), None)
+    if id_col:
+        usuarios = sub.groupby(cols["motivo"], dropna=False)[id_col].nunique()
+    else:
+        usuarios = sub[cols["motivo"]].value_counts()
+    usuarios = usuarios.sort_values(ascending=False)
+    intentos = sub.groupby(cols["motivo"], dropna=False).size().reindex(usuarios.index).fillna(0).astype(int)
+
+    total_users = int(sub[id_col].dropna().nunique()) if id_col else int(usuarios.sum())
     out = pd.DataFrame({
-        "Motivo": counts.index,
-        "Veces": counts.values,
-        "Pct": counts.values / total if total else 0,
+        "Motivo": usuarios.index,
+        "Veces": usuarios.values,            # ahora = usuarios unicos
+        "Intentos": intentos.values,         # cuenta cruda de intentos (referencia)
+        "Pct": (usuarios.values / total_users) if total_users else 0,
     })
     out["Ranking"] = np.arange(1, len(out) + 1)
     out["MotivoES"] = out["Motivo"].apply(translate_motivo)
@@ -742,18 +814,43 @@ def by_tipo(df, cols, denied_mask):
 
 
 def by_marca(df, cols, approved_mask, denied_mask):
+    """Aggregate by franquicia (Marca de tarjeta). Cuenta USUARIOS UNICOS.
+
+    Aprobado = usuarios con >=1 aprobado en esa franquicia.
+    Negado   = usuarios con >=1 negado en esa franquicia.
+    """
     if "marca" not in cols:
         return pd.DataFrame()
-    g = df[cols["marca"]].fillna("DESCONOCIDA")
-    appr = g[approved_mask].value_counts()
-    den = g[denied_mask].value_counts()
-    idx = sorted(set(appr.index) | set(den.index))
-    out = pd.DataFrame({
-        "Franquicia": idx,
-        "Aprobado": [int(appr.get(i, 0)) for i in idx],
-        "Negado": [int(den.get(i, 0)) for i in idx],
-    })
-    out["Total"] = out["Aprobado"] + out["Negado"]
+    id_col = next((c for c in ID_CLIENT_CANDIDATES if c in df.columns), None)
+    marca_norm = df[cols["marca"]].astype(str).fillna("DESCONOCIDA")
+    if id_col:
+        # Per-franquicia: unique users
+        tmp = pd.DataFrame({
+            "_marca": marca_norm.values,
+            "_id": df[id_col].astype(str).values,
+            "_ap": approved_mask.values,
+            "_dn": denied_mask.values,
+        })
+        total = tmp.groupby("_marca")["_id"].nunique()
+        appr = tmp.loc[tmp["_ap"]].groupby("_marca")["_id"].nunique().reindex(total.index).fillna(0).astype(int)
+        den = tmp.loc[tmp["_dn"]].groupby("_marca")["_id"].nunique().reindex(total.index).fillna(0).astype(int)
+        out = pd.DataFrame({
+            "Franquicia": total.index,
+            "Aprobado": appr.values,
+            "Negado": den.values,
+            "Total": total.values,
+        })
+    else:
+        # Fallback: count attempts (no id column available)
+        appr_counts = marca_norm[approved_mask].value_counts()
+        den_counts = marca_norm[denied_mask].value_counts()
+        idx = sorted(set(appr_counts.index) | set(den_counts.index))
+        out = pd.DataFrame({
+            "Franquicia": idx,
+            "Aprobado": [int(appr_counts.get(i, 0)) for i in idx],
+            "Negado": [int(den_counts.get(i, 0)) for i in idx],
+        })
+        out["Total"] = out["Aprobado"] + out["Negado"]
     out["TasaExito"] = np.where(out["Total"] > 0, out["Aprobado"] / out["Total"], 0)
     out = out.sort_values("Total", ascending=False).reset_index(drop=True)
     return out
@@ -1057,40 +1154,46 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
     def page_decor(canv, d):
         canv.saveState()
         w, h = A4
-        # Banner de 1.3 cm con dos lineas para evitar overlap titulo/fecha
+        # Banner de 1.3 cm. Lado izquierdo: titulo + sede. Lado derecho: dos
+        # lineas con labels claros (rango de la data y fecha de generacion).
         canv.setFillColor(PRIMARY)
         canv.rect(0, h - 1.3 * cm, w, 1.3 * cm, fill=1, stroke=0)
         canv.setFillColor(ACCENT)
         canv.rect(0, h - 1.35 * cm, w, 0.05 * cm, fill=1, stroke=0)
         canv.setFillColor(colors.white)
+
         # Linea 1: marca + titulo
         canv.setFont("Helvetica-Bold", 11.5)
         canv.drawString(1.0 * cm, h - 0.50 * cm, "REPORTE DEBITOS - EVO")
 
-        # Linea 2: sede izquierda, periodo+fecha derecha. Auto-fit defensivo.
-        right_text = f"{period_str}  ·  {generated_str}"
-        right_font = "Helvetica"
-        right_size = 8.5
-        right_w = canv.stringWidth(right_text, right_font, right_size)
+        # Lado derecho (dos lineas con etiqueta explicita)
+        right_top = f"Fecha de generacion de datos: {period_str}"
+        right_bot = f"Generado el: {generated_str}"
+        canv.setFont("Helvetica", 7.5)
+        canv.drawRightString(w - 1.0 * cm, h - 0.85 * cm, right_top)
+        canv.setFillColor(colors.HexColor("#C9D6E2"))
+        canv.setFont("Helvetica", 7)
+        canv.drawRightString(w - 1.0 * cm, h - 1.18 * cm, right_bot)
 
+        # Sede izquierda con auto-shrink defensivo
+        canv.setFillColor(colors.white)
         sede_text = f"Sede: {sede_label.upper()}"
         sede_font = "Helvetica-Bold"
         sede_size = 9.0
-        # Espacio disponible para sede = ancho - margenes - ancho de la fecha - gap
+        # Ancho disponible: hasta donde empieza el texto derecho mas largo
+        right_w = max(
+            canv.stringWidth(right_top, "Helvetica", 7.5),
+            canv.stringWidth(right_bot, "Helvetica", 7),
+        )
         avail = (w - 2.0 * cm) - right_w - (0.6 * cm)
-        # Reduce font hasta que quepa, minimo 7.5
         while sede_size > 7.5 and canv.stringWidth(sede_text, sede_font, sede_size) > avail:
             sede_size -= 0.5
-        # Si aun no cabe, trunca con elipsis
         while canv.stringWidth(sede_text, sede_font, sede_size) > avail and len(sede_text) > 12:
-            sede_text = sede_text[:-2] + "..."
-            sede_text = sede_text.rstrip(".") + "..." if not sede_text.endswith("...") else sede_text
-
+            sede_text = sede_text[:-4] + "..."
         canv.setFont(sede_font, sede_size)
         canv.drawString(1.0 * cm, h - 1.05 * cm, sede_text)
-        canv.setFont(right_font, right_size)
-        canv.drawRightString(w - 1.0 * cm, h - 1.05 * cm, right_text)
 
+        # Footer
         canv.setFillColor(GREY)
         canv.setFont("Helvetica", 7)
         canv.drawCentredString(w / 2, 0.4 * cm, "Confidencial - Uso interno")
@@ -1130,9 +1233,9 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
     if chart_paths.get("donut"):
         left_blocks.append(Image(chart_paths["donut"], width=7.6 * cm, height=4.4 * cm))
 
-    right_blocks = [Paragraph("<b>Top 10 motivos de rechazo (en espanol)</b>", styles["Small"])]
+    right_blocks = [Paragraph("<b>Top 15 motivos de rechazo (en espanol)</b>", styles["Small"])]
     if not motivos.empty:
-        m2 = motivos.head(10).copy()
+        m2 = motivos.head(15).copy()
         m2["Pct"] = (m2["Pct"] * 100).round(1).astype(str) + "%"
         m2["MotivoES"] = m2["MotivoES"].apply(lambda x: (x[:55] + "...") if isinstance(x, str) and len(x) > 58 else x)
         m2["Veces"] = m2["Veces"].apply(fmt_int)
@@ -1205,8 +1308,8 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
         story.append(Spacer(1, 3))
     elif not motivos.empty:
         # Tabla de motivos con accion sugerida (texto con wrap, no truncado)
-        story.append(Paragraph("<b>Acciones por motivo (top 10)</b>", styles["Small"]))
-        ac = motivos.head(10).copy()
+        story.append(Paragraph("<b>Acciones por motivo (top 15)</b>", styles["Small"]))
+        ac = motivos.head(15).copy()
 
         cell_style = ParagraphStyle(
             "ActCell", parent=styles["Body"],
@@ -1244,6 +1347,41 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
         story.append(action_table)
         story.append(Spacer(1, 3))
 
+    # --- Franquicias (usuarios unicos) ---
+    if not marcas.empty:
+        franq_rows = [["Franquicia", "Aprobado", "Negado"]]
+        # Mostrar hasta 8 para no romper la pagina
+        for _, r in marcas.head(8).iterrows():
+            franq_rows.append([str(r["Franquicia"]), fmt_int(r["Aprobado"]), fmt_int(r["Negado"])])
+        franq_table = Table(
+            franq_rows,
+            colWidths=[6.5 * cm, 2.5 * cm, 2.5 * cm],
+            repeatRows=1,
+        )
+        franq_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), PRIMARY),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 7.5),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 1), (-1, -1), 7.5),
+            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LINEBELOW", (0, 0), (-1, 0), 1, ACCENT),
+            ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#DCE2EC")),
+            *[("BACKGROUND", (0, i), (-1, i), LIGHT)
+              for i in range(1, len(franq_rows)) if i % 2 == 0],
+        ]))
+        story.append(Paragraph(
+            "<b>Franquicias (usuarios unicos)</b>", styles["Small"]))
+        story.append(franq_table)
+        story.append(Spacer(1, 3))
+
     # --- Conclusiones + Recomendaciones (compact, side by side) ---
     insights = build_insights(summary, sedes, motivos, tipos)
     recs = build_recommendations(summary, sedes, motivos, tipos)
@@ -1252,11 +1390,11 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
                                  textColor=colors.HexColor("#1B2535"))
     h_style = ParagraphStyle("h", parent=styles["Small"], fontSize=8.5, textColor=PRIMARY, leading=10)
     concl_left = [Paragraph("<b>Conclusiones clave</b>", h_style)]
-    for it in insights[:3]:
+    for it in insights[:5]:
         concl_left.append(Paragraph(f"• {it}", concl_style))
 
     concl_right = [Paragraph("<b>Recomendaciones</b>", h_style)]
-    for r in recs[:3]:
+    for r in recs[:5]:
         concl_right.append(Paragraph(f"• {r}", concl_style))
 
     c_table = Table([[concl_left, concl_right]],
@@ -1291,9 +1429,28 @@ def build_insights(summary, sedes, motivos, tipos):
     if "amount_total" in summary:
         recovered = summary.get("amount_approved", 0)
         lost = summary.get("amount_denied", 0)
-        out.append(f"Monto total cursado: <b>{fmt_money(summary['amount_total'])}</b>. "
-                   f"Recuperado: <b>{fmt_money(recovered)}</b>. "
-                   f"En riesgo (negado): <b>{fmt_money(lost)}</b>.")
+        clients_total = summary.get("clients_total") or 0
+        ever_ap = summary.get("users_ever_approved") or 0
+        never_ap = summary.get("users_never_approved") or 0
+        sales_total = summary.get("sales_total") or 0
+        sales_rec = summary.get("sales_recovered") or 0
+        sales_at_risk = summary.get("sales_at_risk") or 0
+        pct_rec_users = (ever_ap / clients_total * 100) if clients_total else 0
+        pct_risk_users = (never_ap / clients_total * 100) if clients_total else 0
+        out.append(
+            f"Monto total cursado: <b>{fmt_money(summary['amount_total'])}</b> "
+            f"({fmt_int(clients_total)} usuarios distintos)."
+        )
+        out.append(
+            f"Recuperado: <b>{fmt_money(recovered)}</b> "
+            f"({pct_rec_users:.1f}% de usuarios = {fmt_int(ever_ap)} con aprobado; "
+            f"{fmt_int(sales_rec)} de {fmt_int(sales_total)} ventas)."
+        )
+        out.append(
+            f"En riesgo: <b>{fmt_money(lost)}</b> "
+            f"({pct_risk_users:.1f}% de usuarios = {fmt_int(never_ap)} nunca aprobados; "
+            f"{fmt_int(sales_at_risk)} ventas)."
+        )
     if not motivos.empty:
         top3 = motivos.head(3)
         parts = [f"<b>{m[:55]}{'...' if len(m)>55 else ''}</b> ({p*100:.1f}%)"
@@ -1322,22 +1479,32 @@ def build_recommendations(summary, sedes, motivos, tipos):
     recs = []
     if not motivos.empty:
         top1 = motivos.iloc[0]
-        recs.append(f"Atacar el motivo #1 (<b>{top1['MotivoES']}</b>, "
-                    f"{top1['Pct']*100:.1f}% del total negado): {top1['Accion']}")
+        recs.append(f"<b>Motivo #1</b> ({top1['MotivoES']}, {top1['Pct']*100:.1f}% usuarios): {top1['Accion']}")
     if not tipos.empty:
-        rev = tipos[tipos["Tipo"].astype(str).str.lower() == "reversible"]["Veces"].sum()
+        rev = int(tipos[tipos["Tipo"].astype(str).str.lower() == "reversible"]["Veces"].sum())
         if rev > 0:
-            recs.append(f"Activar pipeline de reintentos automaticos sobre los <b>{fmt_int(rev)}</b> rechazos reversibles "
-                        "(probar reintento a 24h y a 72h con monitoreo de exito incremental).")
+            recs.append(f"Reintentos automaticos a 24h y 72h sobre <b>{fmt_int(rev)}</b> rechazos reversibles.")
     if not sedes.empty:
         avg = summary["success_rate"]
         bad = sedes[(sedes["Total"] >= 200) & (sedes["TasaExito"] < avg * 0.85)]
         if not bad.empty:
-            recs.append(f"Auditoria operativa en {len(bad)} sede(s) con tasa de exito inferior al 85% del promedio: "
-                        "validar calidad del registro inicial de medio de pago y procesos de actualizacion en recepcion.")
-    recs.append("Establecer un tablero diario con tasa de exito por sede; alertar cuando una sede caiga 5 pp por debajo del promedio dos dias seguidos.")
-    recs.append("Definir SLA mensual de tasa de exito por sede y vincular a evaluacion de desempeno del responsable comercial.")
-    recs.append("Cruzar motivos de \"profile not found\" / \"tarjeta no registrada\" con la base de afiliacion: hay datos faltantes en el alta.")
+            recs.append(f"Auditoria operativa en <b>{len(bad)} sede(s)</b> por debajo del 85% del promedio.")
+    never_ap = summary.get("users_never_approved") or 0
+    if never_ap > 0:
+        recs.append(
+            f"Contactar a los <b>{fmt_int(never_ap)}</b> usuarios nunca aprobados (SMS + email) "
+            f"para actualizar medio de pago."
+        )
+    sales_risk = summary.get("sales_at_risk") or 0
+    risk_money = summary.get("amount_denied", 0)
+    if sales_risk > 0:
+        recs.append(
+            f"Gestion manual sobre <b>{fmt_int(sales_risk)}</b> ventas en riesgo "
+            f"(<b>{fmt_money(risk_money)}</b>), priorizando >= 3 intentos negados."
+        )
+    recs.append("Tablero diario por sede; alerta si baja 5pp del promedio 2 dias seguidos.")
+    recs.append("SLA mensual de tasa de exito por sede ligado al responsable.")
+    recs.append("Cruce 'profile not found' / 'tarjeta no registrada' con afiliacion (datos faltantes).")
     return recs
 
 
