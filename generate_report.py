@@ -44,7 +44,7 @@ from motivos import MOTIVO_CATALOG, lookup_motivo, translate_motivo
 
 # ------------------ API config ------------------
 # Bumped when API helpers change. UI lee esto para mostrar version cargada.
-API_FEATURE_VERSION = "v4.1-pdf-top15-franq"
+API_FEATURE_VERSION = "v4.2-pdf-trend-pulido"
 
 DEFAULT_API_URL = os.environ.get(
     "EVO_DEBITS_URL",
@@ -822,7 +822,10 @@ def by_marca(df, cols, approved_mask, denied_mask):
     if "marca" not in cols:
         return pd.DataFrame()
     id_col = next((c for c in ID_CLIENT_CANDIDATES if c in df.columns), None)
-    marca_norm = df[cols["marca"]].astype(str).fillna("DESCONOCIDA")
+    # fillna PRIMERO (astype(str) convertiria NaN en la string literal "nan")
+    marca_norm = df[cols["marca"]].fillna("DESCONOCIDA").astype(str)
+    marca_norm = marca_norm.replace({"nan": "DESCONOCIDA", "NaN": "DESCONOCIDA",
+                                      "None": "DESCONOCIDA", "": "DESCONOCIDA"})
     if id_col:
         # Per-franquicia: unique users
         tmp = pd.DataFrame({
@@ -977,26 +980,84 @@ def chart_motivos_pie(motivos, path, n=8):
 
 
 def chart_trend(daily, path):
+    """Bar chart con tasa de exito superpuesta. Pulido para reportes."""
     if daily.empty:
         return None
-    fig, ax1 = plt.subplots(figsize=(8.4, 2.6), dpi=180)
-    ax1.bar(daily["Dia"], daily["Aprobado"], color="#1F8A4C", label="Aprobado", alpha=0.85)
-    ax1.bar(daily["Dia"], daily["Negado"], bottom=daily["Aprobado"], color="#C0392B", label="Negado", alpha=0.85)
-    ax1.set_ylabel("Intentos por dia")
-    ax1.yaxis.set_major_formatter(mtick.FuncFormatter(lambda x, _: fmt_int(x)))
+    n_days = len(daily)
+    # Anchos y espaciado adaptativos al numero de dias
+    fig_w = max(7.5, min(11.0, 1.2 + 0.55 * n_days))
+    fig, ax1 = plt.subplots(figsize=(fig_w, 3.2), dpi=200)
+
+    x = np.arange(n_days)
+    bar_w = 0.78
+    aprobados = daily["Aprobado"].astype(float).values
+    negados = daily["Negado"].astype(float).values
+    totals = aprobados + negados
+
+    ax1.bar(x, aprobados, width=bar_w, color="#1F8A4C", label="Aprobado",
+            alpha=0.92, edgecolor="white", linewidth=0.6)
+    ax1.bar(x, negados, bottom=aprobados, width=bar_w, color="#C0392B",
+            label="Negado", alpha=0.92, edgecolor="white", linewidth=0.6)
+
+    # Etiquetas de total encima de cada barra
+    if len(totals) > 0:
+        head = max(totals.max() * 0.04, 1)
+        for i, total in enumerate(totals):
+            ax1.text(i, total + head, fmt_int(int(total)),
+                     ha="center", va="bottom", fontsize=7.5,
+                     color="#0F2A4A", fontweight="bold")
+
+    ax1.set_ylabel("Intentos por dia", fontsize=8.5)
+    ax1.set_ylim(0, (totals.max() if len(totals) else 1) * 1.20)
+    ax1.yaxis.set_major_formatter(mtick.FuncFormatter(lambda v, _: fmt_int(v)))
+    ax1.tick_params(axis="y", labelsize=7.5)
+    ax1.grid(axis="y", linestyle="--", alpha=0.25, color="#7A8597")
+    ax1.set_axisbelow(True)
+
+    # Eje X: fechas legibles
+    ax1.set_xticks(x)
+    try:
+        labels = [d.strftime("%d %b") for d in daily["Dia"]]
+    except Exception:
+        labels = [str(d)[:10] for d in daily["Dia"]]
+    rot = 0 if n_days <= 7 else (35 if n_days <= 14 else 55)
+    ax1.set_xticklabels(labels, rotation=rot, ha="right" if rot else "center",
+                        fontsize=7.5)
+
+    # Eje secundario: tasa de exito como linea + anotaciones
     ax2 = ax1.twinx()
-    ax2.plot(daily["Dia"], daily["TasaExito"] * 100, color="#0F2A4A", linewidth=2, marker="o", markersize=3, label="Tasa exito")
-    ax2.set_ylabel("Tasa de exito (%)")
-    ax2.set_ylim(0, 100)
+    rate_pct = daily["TasaExito"].astype(float).values * 100
+    ax2.plot(x, rate_pct, color="#0F2A4A", linewidth=2.2, marker="o",
+             markersize=5, label="Tasa exito",
+             markeredgecolor="white", markeredgewidth=0.8)
+    for i, rate in enumerate(rate_pct):
+        ax2.text(i, rate + 3.5, f"{rate:.1f}%", ha="center", va="bottom",
+                 fontsize=6.8, color="#0F2A4A", fontweight="bold")
+    ax2.set_ylabel("Tasa de exito (%)", fontsize=8.5)
+    ax2.set_ylim(0, 108)
+    ax2.tick_params(axis="y", labelsize=7.5)
     ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_color("#7A8597")
     ax2.grid(False)
-    fig.autofmt_xdate()
+
+    # Combinar leyendas debajo del titulo
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1 + h2, l1 + l2, loc="upper center", ncol=3, frameon=False, fontsize=8, bbox_to_anchor=(0.5, -0.18))
-    ax1.set_title("Tendencia diaria de descuentos")
+    leg = ax1.legend(h1 + h2, l1 + l2,
+                     loc="upper center", ncol=3, frameon=False,
+                     fontsize=8, bbox_to_anchor=(0.5, -0.22))
+
+    ax1.set_title("Tendencia diaria de descuentos", fontsize=10.5,
+                  fontweight="bold", color="#0F2A4A", pad=10)
+
+    # Quitar bordes innecesarios
+    for spine in ("top", "right"):
+        ax1.spines[spine].set_visible(False)
+    ax1.spines["left"].set_color("#7A8597")
+    ax1.spines["bottom"].set_color("#7A8597")
+
     fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight")
+    fig.savefig(path, bbox_inches="tight", dpi=200)
     plt.close(fig)
 
 
@@ -1274,25 +1335,25 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
     avg = summary["success_rate"]
     multi_sede = len(sedes) > 1
     if multi_sede:
-        worst = sedes[sedes["Total"] >= 200].sort_values("TasaExito").head(5).copy()
+        worst = sedes[sedes["Total"] >= 200].sort_values("TasaExito").head(15).copy()
         worst["TasaExito"] = (worst["TasaExito"] * 100).round(1).astype(str) + "%"
         worst["Total"] = worst["Total"].apply(fmt_int)
         worst = worst[["Sede", "Total", "TasaExito"]]
         worst.columns = ["Sede", "Total", "Tasa"]
 
-        big = sedes.sort_values("Negado", ascending=False).head(5).copy()
+        big = sedes.sort_values("Negado", ascending=False).head(15).copy()
         big["TasaExito"] = (big["TasaExito"] * 100).round(1).astype(str) + "%"
         for c in ("Negado", "Total"):
             big[c] = big[c].apply(fmt_int)
         big = big[["Sede", "Negado", "TasaExito"]]
         big.columns = ["Sede", "Negados", "Tasa"]
 
-        sedes_left = [Paragraph("<b>Top 5 sedes con peor tasa de exito (vol >=200)</b>", styles["Small"]),
+        sedes_left = [Paragraph("<b>Top 15 sedes con peor tasa de exito (vol >=200)</b>", styles["Small"]),
                       df_to_table(worst,
                                   col_widths=[5.6*cm, 1.5*cm, 1.4*cm],
                                   font_size=7.0,
                                   align_map={"Total": "RIGHT", "Tasa": "RIGHT"})]
-        sedes_right = [Paragraph("<b>Top 5 sedes con mas fallos absolutos</b>", styles["Small"]),
+        sedes_right = [Paragraph("<b>Top 15 sedes con mas fallos absolutos</b>", styles["Small"]),
                        df_to_table(big,
                                    col_widths=[5.6*cm, 1.5*cm, 1.4*cm],
                                    font_size=7.0,
@@ -1350,8 +1411,8 @@ def build_pdf(out_path, df, cols, summary, sedes, motivos, tipos, marcas, daily,
     # --- Franquicias (usuarios unicos) ---
     if not marcas.empty:
         franq_rows = [["Franquicia", "Aprobado", "Negado"]]
-        # Mostrar hasta 8 para no romper la pagina
-        for _, r in marcas.head(8).iterrows():
+        # Top 15 franquicias
+        for _, r in marcas.head(15).iterrows():
             franq_rows.append([str(r["Franquicia"]), fmt_int(r["Aprobado"]), fmt_int(r["Negado"])])
         franq_table = Table(
             franq_rows,
